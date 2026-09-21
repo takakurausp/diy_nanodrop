@@ -1,13 +1,20 @@
 from PIL import Image, ImageDraw, ImageFont
+import os
 
 W, H = 980, 740
 img = Image.new("RGB", (W, H), "#f5f5f0")
 d = ImageDraw.Draw(img)
 
 def font(sz):
-    p="/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-    try: return ImageFont.truetype(p, sz)
-    except Exception: pass
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "C:/Windows/Fonts/meiryo.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+        "C:/Windows/Fonts/YuGothM.ttc",
+    ]
+    for p in candidates:
+        try: return ImageFont.truetype(p, sz)
+        except Exception: pass
     return ImageFont.load_default()
 
 def box(x,y,w,h,label,sub=None,col="#333"):
@@ -19,7 +26,7 @@ def line(x1,y1,x2,y2,col,w=2):
     d.line([x1,y1,x2,y2], fill=col, width=w)
 
 d.text((W/2, 18), text="DIY Nanodrop (UV) — Block Diagram", anchor="mm", font=font(16), fill="#222")
-d.text((W/2, 40), text="LGT8F328P · 265nm+280nm UVC LED（切替）· GUVA-S12SD", anchor="mm", font=font(11), fill="#555")
+d.text((W/2, 40), text="LGT8F328P · 265nm+280nm UVC LED（切替）· AS7331 (I2C UV-A/B/C)", anchor="mm", font=font(11), fill="#555")
 
 box(40,90,150,40,"DC 9V アダプタ",None)
 box(380,240,200,160,"LGT8F328P (Nano)",None,"#000")
@@ -32,7 +39,7 @@ box(640,248,55,44,"MOSFET Q2",None)
 # 電源: LM2596降圧で5V生成 + LED用定電流(LM2596 CC)
 box(70,300,180,60,"LM2596 降圧\n5V (MCU/センサー)",None)
 box(70,400,180,60,"LM2596 定電流\n150mA (LED用)",None)
-box(380,520,200,70,"GUVA-S12SD モジュール","アナログ出力 0-1V · 240-370nm")
+box(380,520,200,70,"AS7331 UV センサ (I2C)","UVA/UVB/UVC · 2.7-3.6V · 3ch")
 box(120,520,180,70,"OLED 0.96 I2C（任意）",None)
 
 # 9V → LM2596降圧(5V) → MCU
@@ -49,7 +56,7 @@ line(695,240,700,270,"#0a0",2)
 # ゲート駆動 (MCU→Q1/Q2、5V直結で論理レベル)
 line(580,300,640,180,"#c00",2); d.text((605,235), text="PWM Q1", anchor="mm", font=font(9), fill="#c00")
 line(580,340,640,270,"#0a0",2); d.text((605,305), text="PWM Q2", anchor="mm", font=font(9), fill="#0a0")
-line(480,520,480,400,"#00c",2); d.text((492,470), text="ANALOG IN", anchor="lm", font=font(10), fill="#00c")
+line(480,520,480,400,"#00c",2); d.text((492,470), text="I2C (SDA/SCL)", anchor="lm", font=font(10), fill="#00c")
 d.arc((300,470,360,555),start=90,end=180,fill="#666",width=2)
 d.text((330,470), text="SDA/SCL", anchor="mm", font=font(10), fill="#666")
 line(190,110,380,300,"#c00",2); d.text((255,180), text="VCC", anchor="mm", font=font(10), fill="#c00")
@@ -57,7 +64,7 @@ line(190,110,380,300,"#c00",2); d.text((255,180), text="VCC", anchor="mm", font=
 line(60,680,920,680,"#333",3)
 d.text((70,702), text="GND（共通グランド: LED・センサー・MCU・ディスプレイ）", anchor="lm", font=font(10), fill="#333")
 
-d.text((40,725), text="Note: GUVA-S12SD のピーク感度は約352nm。260/280nm では感度が低い（ピークの約20%/約40%）ので、安定したLED駆動＋平均化が重要。校正係数はLGT8F328P内蔵EEPROMへ保存(再起動時に自動適用)。", anchor="lm", font=font(9), fill="#888")
+d.text((40,725), text="Note: AS7331 はI2Cデジタル3ch UVセンサ (2.7-3.6V)。265nmはUVC、280nmはUVBで受光。5V MCUとはレベルシフタ経由で接続。校正係数はLGT8F328P内蔵EEPROMへ保存(再起動時に自動適用)。", anchor="lm", font=font(9), fill="#888")
 
 # ============================================================
 # 光学レイアウト（上から見た図）: V字配置・内傾 LED
@@ -86,10 +93,10 @@ d.rectangle([cvx-35, cvy-28, cvx+35, cvy-27], outline="#444", width=2, fill="#cc
 d.rectangle([cvx-35, cvy-26, cvx+35, cvy-16], outline="#0af", width=2, fill="#e0f4ff")
 d.text((cvx, cvy-10), text="UV-grade fused silica 窓", anchor="mm", font=font(8), fill="#0af")
 
-# 検出器 GUVA-S12SD — キュベットの反対側（光軸の延長上）
+# 検出器 AS7331 — キュベットの反対側（光軸の延長上）
 detx, dety = 490, 680
 d.rectangle([detx-55, dety-22, detx+55, dety+22], outline="#000", width=2, fill="#fff")
-d.text((detx, dety), text="GUVA-S12SD\n(単一検出器)", anchor="mm", font=font(11), fill="#000")
+d.text((detx, dety), text="AS7331\n(3ch UV-A/B/C)", anchor="mm", font=font(11), fill="#000")
 
 # 光軸（サンプル→検出器）
 d.line([cvx, cvy+30, detx, dety-22], fill="#00c", width=2)
@@ -121,5 +128,6 @@ d.text((rx-95, ry+100), text="θ≈45°", anchor="mm", font=font(10), fill="#777
 # 放熱板干渉なし注記
 d.text((490, 382), text="V字配置 → 2LEDの放熱板が干渉せず、切断不要。内傾でビームをキュベット中心に集光。", anchor="mm", font=font(10), fill="#555")
 
-img.save("/home/koichi/projects/diy_nanodrop/nanodrop_circuit.png")
-print("saved /home/koichi/projects/diy_nanodrop/nanodrop_circuit.png", img.size)
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nanodrop_circuit.png")
+img.save(out)
+print("saved", out, img.size)

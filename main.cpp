@@ -1,9 +1,21 @@
 /*
- * DIY Nanodrop (UV) - LGT8F328P Nano  [STANDALONE + CALIBRATION]
+ * DIY Nanodrop (UV) - LGT8F328P Nano  [STANDALONE + CALIBRATION]  (AS7331 fork)
  *
- * 265nm + 280nm UVC LED を切替駆動し、GUVA-S12SD で検出。
+ * 265nm + 280nm UVC LED を切替駆動し、AS7331 (SparkFun SEN-23517 / Qwiic 1x1) で検出。
  * 吸光度 A = -log10(I / I0) と純度比 A260/A280 を算出。
  * OLED表示（オプション）＋ Serial出力。校正モード（固定濃度・armステップ式）。
+ *
+ * ---- GUVA-S12SD 版との違い ----
+ *   GUVA-S12SD はアナログ単一チャンネル（A0）だったが、AS7331 は I2C デジタルの
+ *   3チャンネル (UVA/UVB/UVC) UVセンサ。本フォークでは
+ *     265nm LED -> UVC チャンネル (200-280nm)
+ *     280nm LED -> UVB チャンネル (280-320nm)
+ *   を各々使い、機器内で µW/cm² に換算してから吸光度を計算する。
+ *   ドライバはスケッチ内に直接実装（外部ライブラリ不要、Wire のみ）。
+ *
+ *   ※ AS7331 の動作電圧は 2.7-3.6V (3.3V)。5V の LGT8F328P と接続する場合は
+ *     センサを 3.3V で給電し、I2C ラインに双方向レベルシフタを入れること
+ *     （Qwiic ボードの SDA/SCL に 5V を直接かけない）。
  *
  * USE_OLED=1 で OLED 表示有効、USE_OLED=0 で OLED なし（Serial のみ）。
  *   (OLEDには Adafruit_GFX + Adafruit_SSD1306 ライブラリが必要)
@@ -11,7 +23,7 @@
  * ---- ピン配置 (LGT8F328P Nano) ----
  *   LED_265 PWM  -> D3  (PD3, PWM対応)
  *   LED_280 PWM  -> D5  (PD5, PWM対応)
- *   SENSOR       -> A0  (PC0, ADC0)
+ *   AS7331 I2C   -> SDA=D18(PC4), SCL=D19(PC5)  [ハードウェア固定, OLEDと共通]
  *   OLED I2C     -> SDA=D18(PC4), SCL=D19(PC5)  [ハードウェア固定]
  *   CALIB BUTTON -> D7  (PB7)  校正モード切替（プルダウン＋ボタン→VCC）
  *   ARM SWITCH   -> D8  (PB0)  アーム連動スイッチ
@@ -40,18 +52,143 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #endif
 
 // ---- ピン定義 ----
-#define LED_265_PIN   D3    // PWM: 265nm UVC LED (A260)
-#define LED_280_PIN   D5    // PWM: 280nm UVC LED (A280)
-#define SENSOR_PIN    A0    // GUVA-S12SD analog output (ADC0 / PC0)
+#define LED_265_PIN   D3    // PWM: 265nm UVC LED (A260 -> AS7331 UVC)
+#define LED_280_PIN   D5    // PWM: 280nm UVC LED (A280 -> AS7331 UVB)
 #define CALIB_BTN_PIN D7    // 校正モード切替（プルダウン＋ボタン→VCC）
 #define ARM_SW_PIN    D8    // アーム連動スイッチ
 #define ARM_USE_HALL  0    // 0:マクロスイッチ / 1:ホールセンサー（磁石）（プルアップ、押下=LOW）
 
 // ---- パラメータ ----
 #define LED_PWM       255   // 全点灯 (0-255)。出力不足時は下げる
-#define AVG_SAMPLES   64    // 各測定の平均サンプル数
-#define CALIB_MS      300   // LED点灯後の安定待ち(ms)
+#define CALIB_MS      300   // LED点灯後の安定待ち(ms)。AS7331変換はこの後に実施
 #define ARM_DEBounce  15    // アームスイッチデバウンス(ms)
+
+// ============================================================
+// AS7331 UVセンサ（I2C, SparkFun SEN-23517）ドライバ
+//   データシート準拠。CMD（ワンショット）モードで各LED点灯中に1回変換する。
+// ============================================================
+#define AS7331_ADDR        0x74  // A1=A0=0 (SparkFun Qwiic 1x1 デフォルト)
+
+// デフォルト設定（SparkFun ライブラリの初期値に合わせる）
+//   GAIN: enum GAIN_2 = 10 -> ゲイン値 2^(11-10) = 2
+//   TIME: enum TIME_64MS = 6 -> 64ms
+//   CCLK: 0 -> 1.024MHz
+#define AS7331_GAIN_RAW    10
+#define AS7331_TIME_RAW    6
+#define AS7331_CCLK_RAW    0
+#define AS7331_GAIN_X      (1 << (11 - AS7331_GAIN_RAW))
+#define AS7331_CONV_MS     (1 << AS7331_TIME_RAW)
+#define AS7331_CCLK_HZ     (1024.0f * (1 << AS7331_CCLK_RAW))
+
+// フルスケール分解能（チャンネル毎、データシート/SparkFun実装より）
+#define AS7331_FSR_UVA     348160.0f
+#define AS7331_FSR_UVB     387072.0f
+#define AS7331_FSR_UVC     169984.0f
+
+// 測定モード enum: CONT=0, CMD=1, SYNS=2, SYND=3
+#define AS7331_MEAS_CMD    1
+
+// Config レジスタ
+#define AS7331_REG_CFG_OSR     0x00
+#define AS7331_REG_CFG_AGEN    0x02
+#define AS7331_REG_CFG_CREG1   0x06
+#define AS7331_REG_CFG_CREG2   0x07
+#define AS7331_REG_CFG_CREG3   0x08
+#define AS7331_REG_CFG_BREAK   0x09
+#define AS7331_REG_CFG_EDGES   0x0A
+#define AS7331_REG_CFG_OPTREG  0x0B
+
+// Measure レジスタ
+#define AS7331_REG_MRES1       0x02  // UVA (16-bit LE)
+#define AS7331_REG_MRES2       0x03  // UVB
+#define AS7331_REG_MRES3       0x04  // UVC
+
+// OSR ビット: dos[2:0], sw_res[3], pd[6], ss[7]
+#define AS7331_OPMODE_CFG      0x02
+#define AS7331_OPMODE_MEAS     0x03
+
+// この値未満のブランク信号は異常（汚れ/未設置/結線ミス）とみなす [µW/cm²]
+#define AS7331_MIN_UV          0.5f
+
+static bool as7331WriteReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(AS7331_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool as7331ReadRegs(uint8_t reg, uint8_t* buf, uint8_t len) {
+  Wire.beginTransmission(AS7331_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;          // repeated start
+  if (Wire.requestFrom((uint8_t)AS7331_ADDR, len) != len) return false;
+  for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+  return true;
+}
+
+// 生カウント -> µW/cm² （CMD/CONT/SYNS モード: 式3）
+static float as7331CountsToUwCm2(uint16_t raw, float fsr) {
+  float factor = fsr / ((float)AS7331_GAIN_X * (float)AS7331_CONV_MS * AS7331_CCLK_HZ);
+  return (float)raw * factor;
+}
+
+// ソフトウェアリセット後、CFGモードで設定を書き込み、MEASモードへ移行する
+static bool as7331Begin() {
+  // OSRはどの動作モードでも書けるので、まずCFGモード・パワーダウンへ寄せる
+  as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_CFG | (1 << 6));
+  delay(1);
+
+  // AGEN レジスタでデバイスID確認（デバイスID上位ニブル = 0x2）
+  uint8_t osr = 0;
+  if (!as7331ReadRegs(AS7331_REG_CFG_AGEN, &osr, 1)) return false;
+  if ((osr & 0xF0) != 0x20) return false;
+
+  // ソフトウェアリセット
+  if (!as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_CFG | (1 << 6) | 0x08)) return false;
+  delay(10);
+
+  // CFGモード・パワーダウン
+  if (!as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_CFG | (1 << 6))) return false;
+  delay(1);
+
+  // CREG1: gain[7:4], time[3:0]
+  uint8_t creg1 = (uint8_t)((AS7331_GAIN_RAW << 4) | (AS7331_TIME_RAW & 0x0F));
+  // CREG2: デジタル分周なし / SYND温度変換は未使用
+  uint8_t creg2 = 0x00;
+  // CREG3: mmode[7:6]=CMD, cclk[1:0]
+  uint8_t creg3 = (uint8_t)((AS7331_MEAS_CMD << 6) | (AS7331_CCLK_RAW & 0x03));
+
+  if (!as7331WriteReg(AS7331_REG_CFG_CREG1, creg1)) return false;
+  if (!as7331WriteReg(AS7331_REG_CFG_CREG2, creg2)) return false;
+  if (!as7331WriteReg(AS7331_REG_CFG_CREG3, creg3)) return false;
+  if (!as7331WriteReg(AS7331_REG_CFG_BREAK, 25)) return false;  // 25*8us=200us
+  if (!as7331WriteReg(AS7331_REG_CFG_EDGES, 1)) return false;
+  if (!as7331WriteReg(AS7331_REG_CFG_OPTREG, 0x01)) return false; // repeat start有効
+
+  // MEASモード・パワーアップ（ss=0: まだ開始しない）
+  osr = AS7331_OPMODE_MEAS;  // pd=0, ss=0
+  if (!as7331WriteReg(AS7331_REG_CFG_OSR, osr)) return false;
+
+  return true;
+}
+
+// ワンショット変換を開始（ss=1）
+static bool as7331Start() {
+  uint8_t osr = 0;
+  if (!as7331ReadRegs(AS7331_REG_CFG_OSR, &osr, 1)) return false;
+  osr |= (1 << 7);  // start state
+  return as7331WriteReg(AS7331_REG_CFG_OSR, osr);
+}
+
+// UVA/UVB/UVC の生カウントを読み出す（連続6バイト, 16-bit LE）
+static bool as7331ReadUV(uint16_t& uva, uint16_t& uvb, uint16_t& uvc) {
+  uint8_t b[6];
+  if (!as7331ReadRegs(AS7331_REG_MRES1, b, sizeof(b))) return false;
+  uva = ((uint16_t)b[1] << 8) | b[0];
+  uvb = ((uint16_t)b[3] << 8) | b[2];
+  uvc = ((uint16_t)b[5] << 8) | b[4];
+  return true;
+}
 
 const float REF_CONCENTRATION = 50.0; // dsDNA [ug/mL] @ A260=1.0 (1cm pathlength)
 
@@ -99,8 +236,7 @@ void showCalibResult(float k260, float b260, float k280, float b280);
 void showResult(float a260, float a280, float ratio, float conc);
 void runMeasure();
 void runCalibration();
-long measureReference(int ledPin);
-long measureSample(int ledPin);
+float measureUV(int ledPin);
 
 volatile bool armPressed = false;   // アームスイッチ割込フラグ
 unsigned long lastArmTime = 0;      // デバウンス用
@@ -114,7 +250,7 @@ unsigned long lastArmTime = 0;      // デバウンス用
 enum MeasureState { M_DO_I0, M_DO_I };
 static MeasureState mState = M_DO_I0;   // 起動時はすぐにブランク測定可能
 static bool measuring = false;          // 実行中の追加割込防止
-static long g_i0_265, g_i0_280;         // ブランク（I0）を保持
+static float g_i0_265 = 0.0f, g_i0_280 = 0.0f; // ブランク（I0）を保持
 
 // ---- アームスイッチ割込 ----
 // マクロ: FALLING（押した時）/ ホール: RISING（磁石が近づいた時）に1回だけ測定
@@ -130,32 +266,33 @@ void armISR() {
 void ledOn(int pin, int pwm) { analogWrite(pin, pwm); }
 void ledOff(int pin)         { analogWrite(pin, 0); }
 
-long readAverage(int pin) {
-  long sum = 0;
-  for (int i = 0; i < AVG_SAMPLES; i++) sum += analogRead(pin);
-  return sum / AVG_SAMPLES;
-}
+// 指定LEDを点灯し、安定後にAS7331でワンショット測定して µW/cm² を返す。
+//   265nm LED -> UVC チャンネル / 280nm LED -> UVB チャンネル
+//   I2C/デバイスエラー時は -1.0f を返す。
+float measureUV(int ledPin) {
+  ledOn(ledPin, LED_PWM);
+  delay(CALIB_MS);
 
-// ブランク（I0）測定
-long measureReference(int ledPin) {
-  ledOn(ledPin, LED_PWM); delay(CALIB_MS);
-  long i0 = readAverage(SENSOR_PIN);
-  ledOff(ledPin);
-  return i0;
-}
+  if (!as7331Start()) {
+    ledOff(ledPin);
+    return -1.0f;
+  }
+  delay(AS7331_CONV_MS + 2);   // 変換完了待ち（コンバージョン時間 + 余裕）
 
-// サンプル（I）測定
-long measureSample(int ledPin) {
-  ledOn(ledPin, LED_PWM); delay(CALIB_MS);
-  long i = readAverage(SENSOR_PIN);
+  uint16_t uva, uvb, uvc;
+  bool ok = as7331ReadUV(uva, uvb, uvc);
   ledOff(ledPin);
-  return i;
+  if (!ok) return -1.0f;
+
+  if (ledPin == LED_265_PIN) return as7331CountsToUwCm2(uvc, AS7331_FSR_UVC);
+  return as7331CountsToUwCm2(uvb, AS7331_FSR_UVB);
 }
 
 // 生吸光度 A_meas = -log10(I/I0)
-float computeAbsorbance(long i, long i0) {
-  if (i0 <= 1) return 9.99f;
-  float ratio = (float)i / (float)i0;
+float computeAbsorbance(float i, float i0) {
+  if (i0 <= AS7331_MIN_UV) return 9.99f;
+  if (i < 0.0f) return 9.99f;
+  float ratio = i / i0;
   if (ratio <= 0.0001f) return 4.0f;
   return -10.0f * log10(ratio);
 }
@@ -184,13 +321,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ARM_SW_PIN), armISR, FALLING);  // 押下でLOW
 #endif
 
-  analogReadResolution(12);               // 12-bit ADC (0-4095)
-  analogReference(DEFAULT);               // AVCC基準
-
   digitalWrite(LED_265_PIN, LOW);
   digitalWrite(LED_280_PIN, LOW);
 
   Wire.begin();
+
 #if USE_OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("OLED not found");   // OLED無しでも測定は続行
@@ -200,8 +335,16 @@ void setup() {
   }
 #endif
 
+  // ---- AS7331 初期化 ----
+  if (!as7331Begin()) {
+    Serial.println("AS7331 not found (0x74) — check I2C wiring");
+    printScreen("AS7331 ERR", "check sensor");
+  } else {
+    Serial.println("AS7331 UV sensor ready (0x74)");
+  }
+
   printScreen("PUT BLANK 1/2", "press arm...");
-  Serial.println("=== DIY Nanodrop (LGT8F328P) ready ===");
+  Serial.println("=== DIY Nanodrop (LGT8F328P + AS7331) ready ===");
 
   // ---- EEPROMから校正係数を読み込む（未保存ならデフォルト1.0/0.0）----
   if (loadCalibration(gK260, gB260, gK280, gB280)) {
@@ -295,15 +438,15 @@ void runMeasure() {
     printScreen("PUT BLANK 1/2", "press arm...");
     Serial.println("--- MEASURE: BLANK ---");
 
-    long i0_265 = measureReference(LED_265_PIN);
-    long i0_280 = measureReference(LED_280_PIN);
+    float i0_265 = measureUV(LED_265_PIN);
+    float i0_280 = measureUV(LED_280_PIN);
     g_i0_265 = i0_265;
     g_i0_280 = i0_280;
 
     // 両ブランクが成立しているか確認（異常時はエラー表示）
-    if (i0_265 <= 1 || i0_280 <= 1) {
+    if (i0_265 < AS7331_MIN_UV || i0_280 < AS7331_MIN_UV) {
       printScreen("MEAS ERR", "check BLANK");
-      Serial.println("BLANK too low — check cuvette/window");
+      Serial.println("BLANK too low (or AS7331 I2C error) — check cuvette/window/wiring");
       mState = M_DO_I0;
       measuring = false;
       return;
@@ -319,8 +462,8 @@ void runMeasure() {
     printScreen("MEASURING", "please wait...");
     Serial.println("--- MEASURE: SAMPLE ---");
 
-    long i_265 = measureSample(LED_265_PIN);
-    long i_280 = measureSample(LED_280_PIN);
+    float i_265 = measureUV(LED_265_PIN);
+    float i_280 = measureUV(LED_280_PIN);
 
     float a260_meas = computeAbsorbance(i_265, g_i0_265);
     float a280_meas = computeAbsorbance(i_280, g_i0_280);
@@ -369,12 +512,12 @@ void runCalibration() {
 
   printScreen("CAL 1/3 BLANK", "measuring...");
   Serial.println("--- CALIB: BLANK ---");
-  long i0_265 = measureReference(LED_265_PIN);
-  long i0_280 = measureReference(LED_280_PIN);
+  float i0_265 = measureUV(LED_265_PIN);
+  float i0_280 = measureUV(LED_280_PIN);
 
-  if (i0_265 <= 1 || i0_280 <= 1) {
+  if (i0_265 < AS7331_MIN_UV || i0_280 < AS7331_MIN_UV) {
     printScreen("CAL ERR", "check BLANK");
-    Serial.println("BLANK too low — check cuvette/window");
+    Serial.println("BLANK too low (or AS7331 I2C error) — check cuvette/window/wiring");
     return;
   }
 
@@ -389,8 +532,8 @@ void runCalibration() {
 
   printScreen("CAL 2/3 DNA", "measuring...");
   Serial.println("--- CALIB: DNA ---");
-  long d_265 = measureSample(LED_265_PIN);
-  long d_280 = measureSample(LED_280_PIN);
+  float d_265 = measureUV(LED_265_PIN);
+  float d_280 = measureUV(LED_280_PIN);
   float dna_meas_260 = computeAbsorbance(d_265, i0_265);
   float dna_meas_280 = computeAbsorbance(d_280, i0_280);
 
@@ -405,8 +548,8 @@ void runCalibration() {
 
   printScreen("CAL 3/3 PROT", "measuring...");
   Serial.println("--- CALIB: PROT ---");
-  long p_265 = measureSample(LED_265_PIN);
-  long p_280 = measureSample(LED_280_PIN);
+  float p_265 = measureUV(LED_265_PIN);
+  float p_280 = measureUV(LED_280_PIN);
   float prot_meas_260 = computeAbsorbance(p_265, i0_265);
   float prot_meas_280 = computeAbsorbance(p_280, i0_280);
 
