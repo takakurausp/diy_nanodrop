@@ -64,7 +64,48 @@ To download data: connect your phone/PC to the same WiFi (or to the
 `mynanodrop` AP when in AP mode) and open `http://<ip>/data.csv`
 (AP mode: `http://192.168.5.1/data.csv`).
 
-## Wiring
+## Sensor options
+
+The sensor is selected at build time with `SENSOR_AS7331` (see the top of
+`nanodrop.ino` or pass a `build_flags` from `platformio.ini`):
+
+| Mode | Macro | Notes |
+|------|-------|-------|
+| AS7331 (I2C, 3ch) | `-DSENSOR_AS7331=1` | Original 265nm->UVC, 280nm->UVB |
+| GUVA-S12SD + ADS1115 (default) | `-DSENSOR_AS7331=0 -DGUVA_USE_ADS1115=1` | External 16-bit I2C ADC, recommended |
+| GUVA-S12SD + ESP32 ADC | `-DSENSOR_AS7331=0 -DGUVA_USE_ADS1115=0` | AOUT -> GPIO33, simple but low accuracy |
+
+### GUVA-S12SD fallback
+
+If the AS7331 is hard to source, the analog **GUVA-S12SD** module can be used
+instead. It is a single broadband channel, so both the 265nm and 280nm
+measurements read the same detector (absorbance is still a ratio `I/I0`, so
+this works, but channel separation/cross-talk is worse than the AS7331).
+
+**Use an external ADC (ADS1115) rather than the ESP32 internal ADC.** Reasons:
+
+- The ESP32 ADC is noisy and non-linear (especially near the rails); factory
+  calibration is poor.
+- The GUVA-S12SD module output is roughly 0-1V, so on the 0-3.3V ESP32 ADC
+  range only ~1/3 of the codes are used, losing resolution.
+- The **ADS1115** is a 16-bit delta-sigma ADC with a PGA. At `+/-2.048V` full
+  scale, a 0-1V signal uses about half the range at ~62.5uV/LSB, and it is
+  stable. It is I2C, so it shares the existing bus.
+
+Wiring (ADS1115):
+```
+GUVA-S12SD AOUT -> ADS1115 AIN0
+ADS1115 SDA/SCL  -> GPIO21 / GPIO22
+ADS1115 ADDR     -> GND (address 0x48)
+ADS1115 VDD/GND  -> 3.3V / GND
+```
+The 265/280 LEDs are unchanged (GPIO16 / GPIO17).
+
+An **ADS1015** (12-bit, cheaper) also works in principle but its conversion
+result is left-justified in the 16-bit register; the current driver assumes
+ADS1115. Ask if you want ADS1015 support.
+
+## Wiring (AS7331)
 
 ```
 LED_265 PWM  -> GPIO16

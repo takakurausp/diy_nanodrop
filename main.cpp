@@ -4,8 +4,17 @@
  * 対象ボード: ideaspark ESP32 2.8" IPS LCD タッチボード (240x320, ST7789, XPT2046)
  *   https://www.amazon.co.jp/dp/B0HHSHFZ8Q
  *
- * 265nm + 280nm UVC LED を切替駆動し、AS7331 (SparkFun SEN-23517) で検出。
+ * 265nm + 280nm UVC LED を切替駆動し、UVセンサで検出。
  * 吸光度 A = -log10(I/I0) と純度比 A260/A280 を算出。
+ *
+ * ---- センサ選択 (下の SENSOR_AS7331 で切替) ----
+ *   SENSOR_AS7331=1 : AS7331 (I2C デジタル 3ch)
+ *   SENSOR_AS7331=0 : GUVA-S12SD (アナログ)  ← AS7331 入手困難時の間に合わせ
+ *     GUVA_USE_ADS1115=1 : 外付けADC ADS1115 (16-bit I2C) を使用【推奨】
+ *     GUVA_USE_ADS1115=0 : ESP32 内蔵ADC (GPIO33) を使用（簡易・精度低）
+ *
+ *   ※ ESP32 内蔵ADCはノイズ・非直線性が大きく、GUVA出力(0-1V)は
+ *     3.3Vレンジの一部しか使えないため分解能が低い。外付け ADS1115 を推奨。
  *
  * ---- 画面構成 ----
  *   ホーム: [Calibration] [Measuring] [Settings] の大きなボタン + Download data
@@ -22,7 +31,8 @@
  *   LCD  : CS=15 DC=2 RST=4 BL=32 / VSPI SCK=18 MISO=19 MOSI=23
  *   Touch: CS=14 IRQ=27
  *   LED_265=GPIO16  LED_280=GPIO17
- *   AS7331: SDA=GPIO21 SCL=GPIO22 (3.3V直結)
+ *   AS7331 / ADS1115: SDA=GPIO21 SCL=GPIO22 (3.3V直結)
+ *   GUVA-S12SD (内蔵ADC使用時): AOUT=GPIO33 (ADC1_CH5)
  */
 
 #include <Arduino.h>
@@ -35,6 +45,21 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <stddef.h>
+
+// ============================================================
+// センサ選択
+// ============================================================
+// AS7331 が使えるなら 1、間に合せで GUVA-S12SD なら 0。
+// PlatformIO 等から -DSENSOR_AS7331=1 で上書き可能。
+#ifndef SENSOR_AS7331
+#define SENSOR_AS7331 0
+#endif
+
+// GUVA-S12SD の読み取り方法 (SENSOR_AS7331=0 のとき有効)
+//   1 = 外付けADC ADS1115 (16-bit I2C) 【推奨】 / 0 = ESP32 内蔵ADC
+#ifndef GUVA_USE_ADS1115
+#define GUVA_USE_ADS1115 1
+#endif
 
 // ============================================================
 // ピン / 画面
@@ -171,11 +196,11 @@ void applyBrightness() {
 
 #define AS7331_OPMODE_CFG      0x02
 #define AS7331_OPMODE_MEAS     0x03
-#define AS7331_MIN_UV          0.5f
 
 #define LED_PWM 255
 #define CALIB_MS 300
 
+#if SENSOR_AS7331
 static bool as7331WriteReg(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(AS7331_ADDR);
   Wire.write(reg);
@@ -237,14 +262,84 @@ static bool as7331ReadUV(uint16_t& uva, uint16_t& uvb, uint16_t& uvc) {
   uvc = ((uint16_t)b[5] << 8) | b[4];
   return true;
 }
+#endif  // SENSOR_AS7331
 
 void ledOn(int pin)  { analogWrite(pin, LED_PWM); }
 void ledOff(int pin) { analogWrite(pin, 0); }
 
-// 指定LEDを点灯し AS7331 でワンショット測定。µW/cm² を返す（エラーは -1）。
+#if !SENSOR_AS7331
+// ============================================================
+// GUVA-S12SD (アナログ) + 外付けADC ADS1115 ドライバ
+//   GUVA は単一チャンネル。265/280 どちらのLEDでも同じAOUTを読む。
+//   吸光度は比 I/I0 なので生カウントのままで良い。
+// ============================================================
+#define SENSOR_PIN 33    // 内蔵ADC使用時の AOUT (GPIO33 = ADC1_CH5)
+#define GUVA_AVG   8     // 1測定あたりの平均サンプル数
+
+#if GUVA_USE_ADS1115
+#define ADS1115_ADDR      0x48  // ADDRピン=GND
+#define ADS1115_REG_CONV  0x00
+#define ADS1115_REG_CFG   0x01
+// OS=1, MUX=AIN0-GND, PGA=±2.048V, single-shot, 128SPS, comparator off
+#define ADS1115_CFG_START 0xC583
+
+static void adsWrite16(uint8_t reg, uint16_t v) {
+  Wire.beginTransmission(ADS1115_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)(v >> 8));
+  Wire.write((uint8_t)(v & 0xFF));
+  Wire.endTransmission();
+}
+
+static uint16_t adsRead16(uint8_t reg) {
+  Wire.beginTransmission(ADS1115_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  if (Wire.requestFrom((uint8_t)ADS1115_ADDR, (uint8_t)2) != 2) return 0;
+  uint16_t v = (uint16_t)Wire.read() << 8;
+  v |= (uint16_t)Wire.read();
+  return v;
+}
+
+static bool ads1115Begin() {
+  Wire.beginTransmission(ADS1115_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+// 単発変換して生カウント(符号付16bit)を返す
+static float ads1115Read() {
+  adsWrite16(ADS1115_REG_CFG, ADS1115_CFG_START);  // 変換開始
+  uint32_t t0 = millis();
+  while (millis() - t0 < 25) {
+    if (adsRead16(ADS1115_REG_CFG) & 0x8000) break; // OS=1: 完了
+    delay(1);
+  }
+  return (float)(int16_t)adsRead16(ADS1115_REG_CONV);
+}
+#endif  // GUVA_USE_ADS1115
+#endif  // !SENSOR_AS7331
+
+// センサ初期化（成功で true）
+bool sensorBegin() {
+#if SENSOR_AS7331
+  return as7331Begin();
+#elif GUVA_USE_ADS1115
+  return ads1115Begin();
+#else
+  analogReadResolution(12);
+  analogSetPinAttenuation(SENSOR_PIN, ADC_11db);  // 0-3.3V レンジ
+  pinMode(SENSOR_PIN, INPUT);
+  return true;
+#endif
+}
+
+// 指定LEDを点灯し、安定後に1回測定して強度を返す（エラー時 -1.0f）。
+//   AS7331: 265nm->UVC / 280nm->UVB を µW/cm² に換算
+//   GUVA  : AOUT を ADC で読む（比 I/I0 用なので単位は任意）
 float measureUV(int ledPin) {
   ledOn(ledPin);
   delay(CALIB_MS);
+#if SENSOR_AS7331
   if (!as7331Start()) { ledOff(ledPin); return -1.0f; }
   delay(AS7331_CONV_MS + 2);
   uint16_t uva, uvb, uvc;
@@ -253,10 +348,30 @@ float measureUV(int ledPin) {
   if (!ok) return -1.0f;
   if (ledPin == LED_265_PIN) return as7331CountsToUwCm2(uvc, AS7331_FSR_UVC);
   return as7331CountsToUwCm2(uvb, AS7331_FSR_UVB);
+#elif GUVA_USE_ADS1115
+  float sum = 0;
+  for (int i = 0; i < GUVA_AVG; i++) sum += ads1115Read();
+  ledOff(ledPin);
+  return sum / GUVA_AVG;
+#else
+  long sum = 0;
+  for (int i = 0; i < GUVA_AVG; i++) sum += analogRead(SENSOR_PIN);
+  ledOff(ledPin);
+  return (float)sum / GUVA_AVG;
+#endif
 }
 
+// ブランク信号の下限（これ未満は汚れ/未設置/結線ミス等）
+#if SENSOR_AS7331
+#define MIN_SIGNAL 0.5f
+#elif GUVA_USE_ADS1115
+#define MIN_SIGNAL 100.0f     // ADS1115 カウント (PGA ±2.048V)
+#else
+#define MIN_SIGNAL 300.0f     // ESP32 内蔵ADC カウント
+#endif
+
 float computeAbsorbance(float i, float i0) {
-  if (i0 <= AS7331_MIN_UV) return 9.99f;
+  if (i0 <= MIN_SIGNAL) return 9.99f;
   if (i < 0.0f) return 9.99f;
   float ratio = i / i0;
   if (ratio <= 0.0001f) return 4.0f;
@@ -531,7 +646,7 @@ void runCalBlank() {
   // 画面更新後に測定
   cal_i0_265 = measureUV(LED_265_PIN);
   cal_i0_280 = measureUV(LED_280_PIN);
-  if (cal_i0_265 < AS7331_MIN_UV || cal_i0_280 < AS7331_MIN_UV) {
+  if (cal_i0_265 < MIN_SIGNAL || cal_i0_280 < MIN_SIGNAL) {
     showMessage("BLANK too low", "check cell/wiring", SCR_CAL_BLANK);
     return;
   }
@@ -621,7 +736,7 @@ void runMeasBlank() {
   showMessage("Measuring BLANK", "please wait...", SCR_MEAS_SAMPLE);
   meas_i0_265 = measureUV(LED_265_PIN);
   meas_i0_280 = measureUV(LED_280_PIN);
-  if (meas_i0_265 < AS7331_MIN_UV || meas_i0_280 < AS7331_MIN_UV) {
+  if (meas_i0_265 < MIN_SIGNAL || meas_i0_280 < MIN_SIGNAL) {
     showMessage("BLANK too low", "check cell/wiring", SCR_MEAS_BLANK);
     return;
   }
@@ -995,13 +1110,24 @@ void setup() {
   wifiBoot();
   setupServer();
 
-  // AS7331
-  bool sensorOk = as7331Begin();
+  // センサ初期化
+  bool sensorOk = sensorBegin();
   if (!sensorOk) {
+#if SENSOR_AS7331
     Serial.println("AS7331 not found (0x74)");
     showMessage("AS7331 not found", "check I2C wiring", SCR_HOME);
+#else
+    Serial.println("ADS1115 not found (0x48)");
+    showMessage("ADS1115 not found", "check I2C wiring", SCR_HOME);
+#endif
   } else {
-    Serial.println("AS7331 ready");
+#if SENSOR_AS7331
+    Serial.println("Sensor: AS7331 ready");
+#elif GUVA_USE_ADS1115
+    Serial.println("Sensor: GUVA-S12SD via ADS1115 ready");
+#else
+    Serial.println("Sensor: GUVA-S12SD via ESP32 ADC ready");
+#endif
   }
 
   Serial.print("WiFi IP: "); Serial.println(currentIPString());
