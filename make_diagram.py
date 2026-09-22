@@ -26,21 +26,21 @@ def line(x1,y1,x2,y2,col,w=2):
     d.line([x1,y1,x2,y2], fill=col, width=w)
 
 d.text((W/2, 18), text="DIY Nanodrop (UV) — Block Diagram", anchor="mm", font=font(16), fill="#222")
-d.text((W/2, 40), text="LGT8F328P · 265nm+280nm UVC LED（切替）· AS7331 (I2C UV-A/B/C)", anchor="mm", font=font(11), fill="#555")
+d.text((W/2, 40), text="ESP32-WROOM-32 + 2.8\" ST7789 LCD · 265nm+280nm UVC LED（切替）· AS7331 (I2C UV-A/B/C)", anchor="mm", font=font(11), fill="#555")
 
 box(40,90,150,40,"DC 9V アダプタ",None)
-box(380,240,200,160,"LGT8F328P (Nano)",None,"#000")
-d.text((480,410), text="12-bit ADC + チャージポンプ", anchor="mm", font=font(10), fill="#555")
-d.text((480,262), text="内蔵EEPROM\n(校正係数保存)", anchor="mm", font=font(9), fill="#c00")
+box(380,240,200,160,"ESP32-WROOM-32",None,"#000")
+d.text((480,410), text="3.3V / 16MB Flash / PWM(LEDC)", anchor="mm", font=font(10), fill="#555")
+d.text((480,262), text="ボード内蔵\n2.8\" ST7789 LCD\n+ タッチ/SD", anchor="mm", font=font(9), fill="#c00")
 box(700,150,210,60,"UVC LED 265nm","3535 Vf6-7V ~150mA")
 box(700,240,210,60,"UVC LED 280nm","3535 Vf6-7V ~150mA")
 box(640,158,55,44,"MOSFET Q1",None)
 box(640,248,55,44,"MOSFET Q2",None)
 # 電源: LM2596降圧で5V生成 + LED用定電流(LM2596 CC)
-box(70,300,180,60,"LM2596 降圧\n5V (MCU/センサー)",None)
+box(70,300,180,60,"USB 5V / LM2596\n5V (ESP32ボード)",None)
 box(70,400,180,60,"LM2596 定電流\n150mA (LED用)",None)
-box(380,520,200,70,"AS7331 UV センサ (I2C)","UVA/UVB/UVC · 2.7-3.6V · 3ch")
-box(120,520,180,70,"OLED 0.96 I2C（任意）",None)
+box(380,520,200,70,"AS7331 UV センサ (I2C)","UVA/UVB/UVC · 3.3V · 3ch")
+box(120,520,180,70,"2.8\" ST7789 LCD\n(ボード内蔵)",None)
 
 # 9V → LM2596降圧(5V) → MCU
 line(140,330,140,380,"#c00",2); d.text((150,360), text="9V", anchor="lm", font=font(9), fill="#c00")
@@ -64,7 +64,7 @@ line(190,110,380,300,"#c00",2); d.text((255,180), text="VCC", anchor="mm", font=
 line(60,680,920,680,"#333",3)
 d.text((70,702), text="GND（共通グランド: LED・センサー・MCU・ディスプレイ）", anchor="lm", font=font(10), fill="#333")
 
-d.text((40,725), text="Note: AS7331 はI2Cデジタル3ch UVセンサ (2.7-3.6V)。265nmはUVC、280nmはUVBで受光。5V MCUとはレベルシフタ経由で接続。校正係数はLGT8F328P内蔵EEPROMへ保存(再起動時に自動適用)。", anchor="lm", font=font(9), fill="#888")
+d.text((40,725), text="Note: ESP32(3.3V) と AS7331(3.3V) は I2C 直結（レベルシフタ不要）。265nmはUVC、280nmはUVBで受光。校正係数はESP32のEEPROMエミュレーションへ保存(再起動時に自動適用)。", anchor="lm", font=font(9), fill="#888")
 
 # ============================================================
 # 光学レイアウト（上から見た図）: V字配置・内傾 LED

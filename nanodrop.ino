@@ -1,94 +1,164 @@
 /*
- * DIY Nanodrop (UV) - LGT8F328P Nano  [STANDALONE + CALIBRATION]  (AS7331 fork)
+ * DIY Nanodrop (UV) - ESP32 + 2.8" ST7789 LCD  [TOUCH UI + WIFI/CSV]
  *
- * 265nm + 280nm UVC LED を切替駆動し、AS7331 (SparkFun SEN-23517 / Qwiic 1x1) で検出。
- * 吸光度 A = -log10(I / I0) と純度比 A260/A280 を算出。
- * OLED表示（オプション）＋ Serial出力。校正モード（固定濃度・armステップ式）。
+ * 対象ボード: ideaspark ESP32 2.8" IPS LCD タッチボード (240x320, ST7789, XPT2046)
+ *   https://www.amazon.co.jp/dp/B0HHSHFZ8Q
  *
- * ---- GUVA-S12SD 版との違い ----
- *   GUVA-S12SD はアナログ単一チャンネル（A0）だったが、AS7331 は I2C デジタルの
- *   3チャンネル (UVA/UVB/UVC) UVセンサ。本フォークでは
- *     265nm LED -> UVC チャンネル (200-280nm)
- *     280nm LED -> UVB チャンネル (280-320nm)
- *   を各々使い、機器内で µW/cm² に換算してから吸光度を計算する。
- *   ドライバはスケッチ内に直接実装（外部ライブラリ不要、Wire のみ）。
+ * 265nm + 280nm UVC LED を切替駆動し、AS7331 (SparkFun SEN-23517) で検出。
+ * 吸光度 A = -log10(I/I0) と純度比 A260/A280 を算出。
  *
- *   ※ AS7331 の動作電圧は 2.7-3.6V (3.3V)。5V の LGT8F328P と接続する場合は
- *     センサを 3.3V で給電し、I2C ラインに双方向レベルシフタを入れること
- *     （Qwiic ボードの SDA/SCL に 5V を直接かけない）。
+ * ---- 画面構成 ----
+ *   ホーム: [Calibration] [Measuring] [Settings] の大きなボタン + Download data
+ *   Calibration: EEPROM の校正データ有無を確認 → 無ければ案内付きで校正開始
+ *   Measuring  : Blank → Sample を毎回ペアで測定し、結果をメモリ保持
+ *   Settings   : 画面の明るさ / WiFi 設定(SSID一覧→WPS) / WiFi初期化 / タッチ校正
  *
- * USE_OLED=1 で OLED 表示有効、USE_OLED=0 で OLED なし（Serial のみ）。
- *   (OLEDには Adafruit_GFX + Adafruit_SSD1306 ライブラリが必要)
+ * ---- WiFi ----
+ *   記憶した SSID/pass があれば STA 接続。無ければ AP モード:
+ *     SSID=mynanodrop / pass=12345678 / IP=192.168.5.1
+ *   Web サーバを常時起動: / に案内、 /data.csv で測定データを CSV ダウンロード。
  *
- * ---- ピン配置 (LGT8F328P Nano) ----
- *   LED_265 PWM  -> D3  (PD3, PWM対応)
- *   LED_280 PWM  -> D5  (PD5, PWM対応)
- *   AS7331 I2C   -> SDA=D18(PC4), SCL=D19(PC5)  [ハードウェア固定, OLEDと共通]
- *   OLED I2C     -> SDA=D18(PC4), SCL=D19(PC5)  [ハードウェア固定]
- *   CALIB BUTTON -> D7  (PB7)  校正モード切替（プルダウン＋ボタン→VCC）
- *   ARM SWITCH   -> D8  (PB0)  アーム連動スイッチ
- *       ARM_USE_HALL=0 : マクロスイッチ（プルアップ、押下=LOW、FALLING）
- *       ARM_USE_HALL=1 : ホールセンサー（プルダウン外付け、磁石でHIGH、RISING）
- *
- * ---- 校正モデル ----
- *   A_true = k_w * A_meas + b_w   (w = 260 or 280)
- *   Purity = (k260/k280) * (A260_true / A280_true)
- *
- *   k/b は校正モードで既知標準から算出し、コードの定数に反映する。
+ * ---- ピン ----
+ *   LCD  : CS=15 DC=2 RST=4 BL=32 / VSPI SCK=18 MISO=19 MOSI=23
+ *   Touch: CS=14 IRQ=27
+ *   LED_265=GPIO16  LED_280=GPIO17
+ *   AS7331: SDA=GPIO21 SCL=GPIO22 (3.3V直結)
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <EEPROM.h>
-
-// USE_OLED はビルド時に -DUSE_OLED=0/1 で設定（デフォルト: OLED なし）
-#if USE_OLED
+#include <SPI.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET  -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-#endif
-
-// ---- ピン定義 ----
-#define LED_265_PIN   D3    // PWM: 265nm UVC LED (A260 -> AS7331 UVC)
-#define LED_280_PIN   D5    // PWM: 280nm UVC LED (A280 -> AS7331 UVB)
-#define CALIB_BTN_PIN D7    // 校正モード切替（プルダウン＋ボタン→VCC）
-#define ARM_SW_PIN    D8    // アーム連動スイッチ
-#define ARM_USE_HALL  0    // 0:マクロスイッチ / 1:ホールセンサー（磁石）（プルアップ、押下=LOW）
-
-// ---- パラメータ ----
-#define LED_PWM       255   // 全点灯 (0-255)。出力不足時は下げる
-#define CALIB_MS      300   // LED点灯後の安定待ち(ms)。AS7331変換はこの後に実施
-#define ARM_DEBounce  15    // アームスイッチデバウンス(ms)
+#include <Adafruit_ST7789.h>
+#include <XPT2046_Touchscreen.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <stddef.h>
 
 // ============================================================
-// AS7331 UVセンサ（I2C, SparkFun SEN-23517）ドライバ
-//   データシート準拠。CMD（ワンショット）モードで各LED点灯中に1回変換する。
+// ピン / 画面
 // ============================================================
-#define AS7331_ADDR        0x74  // A1=A0=0 (SparkFun Qwiic 1x1 デフォルト)
+#define TFT_CS    15
+#define TFT_DC     2
+#define TFT_RST    4
+#define TFT_BL    32
+#define TS_CS     14
+#define TS_IRQ    27
+#define VSPI_SCK  18
+#define VSPI_MISO 19
+#define VSPI_MOSI 23
 
-// デフォルト設定（SparkFun ライブラリの初期値に合わせる）
-//   GAIN: enum GAIN_2 = 10 -> ゲイン値 2^(11-10) = 2
-//   TIME: enum TIME_64MS = 6 -> 64ms
-//   CCLK: 0 -> 1.024MHz
-#define AS7331_GAIN_RAW    10
-#define AS7331_TIME_RAW    6
-#define AS7331_CCLK_RAW    0
+#define LED_265_PIN 16
+#define LED_280_PIN 17
+#define I2C_SDA     21
+#define I2C_SCL     22
+
+#define SCREEN_W 320
+#define SCREEN_H 240
+
+Adafruit_ST7789 display(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen ts(TS_CS, TS_IRQ);
+WebServer server(80);
+
+// ---- 色 (RGB565) ----
+#define COL_BG      ST77XX_BLACK
+#define COL_FG      ST77XX_WHITE
+#define COL_BTN     0x2B7E  // 青系
+#define COL_BTN2    0x4A69  // 灰青
+#define COL_ACCENT  ST77XX_CYAN
+#define COL_OK      ST77XX_GREEN
+#define COL_WARN    ST77XX_YELLOW
+#define COL_ERR     ST77XX_RED
+
+// ---- WiFi AP 既定値 ----
+#define AP_SSID "mynanodrop"
+#define AP_PASS "12345678"
+
+// デバッグ: タッチ生値を Serial に出す
+#define TOUCH_DEBUG 0
+
+// ============================================================
+// 永続化データ (ESP32 EEPROM エミュレーション)
+// ============================================================
+#define EEPROM_SIZE 256
+#define CFG_MAGIC   0x4E414E4F  // "NANO"
+#define CFG_VERSION 2
+
+struct StoredData {
+  uint32_t magic;
+  uint8_t  version;
+  uint8_t  calibValid;   // 校正データ有効
+  uint8_t  wifiValid;    // WiFi 認証情報有効
+  uint8_t  brightness;   // 0-255
+  float    k260, b260, k280, b280;
+  int16_t  tsMinX, tsMaxX, tsMinY, tsMaxY; // タッチ校正
+  char     ssid[33];
+  char     pass[65];
+  uint32_t checksum;
+} __attribute__((packed));
+
+StoredData cfg;
+
+static uint32_t cfgChecksum(const StoredData& d) {
+  const uint8_t* p = (const uint8_t*)&d;
+  size_t n = offsetof(StoredData, checksum);
+  uint32_t s = 0;
+  for (size_t i = 0; i < n; i++) s += p[i];
+  return s;
+}
+
+void cfgDefaults() {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.magic = CFG_MAGIC;
+  cfg.version = CFG_VERSION;
+  cfg.calibValid = 0;
+  cfg.wifiValid = 0;
+  cfg.brightness = 200;
+  cfg.k260 = 1.0f; cfg.b260 = 0.0f;
+  cfg.k280 = 1.0f; cfg.b280 = 0.0f;
+  cfg.tsMinX = 200; cfg.tsMaxX = 3700;
+  cfg.tsMinY = 240; cfg.tsMaxY = 3800;
+  cfg.ssid[0] = 0; cfg.pass[0] = 0;
+}
+
+void loadConfig() {
+  EEPROM.get(0, cfg);
+  if (cfg.magic != CFG_MAGIC || cfg.version != CFG_VERSION ||
+      cfgChecksum(cfg) != cfg.checksum) {
+    cfgDefaults();
+  }
+}
+
+void saveConfig() {
+  cfg.magic = CFG_MAGIC;
+  cfg.version = CFG_VERSION;
+  cfg.checksum = cfgChecksum(cfg);
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
+}
+
+void applyBrightness() {
+  analogWrite(TFT_BL, cfg.brightness);
+}
+
+// ============================================================
+// AS7331 UVセンサドライバ (I2C)
+// ============================================================
+#define AS7331_ADDR        0x74
+
+#define AS7331_GAIN_RAW    10   // GAIN_2 -> 2^(11-10)=2
+#define AS7331_TIME_RAW    6    // 64ms
+#define AS7331_CCLK_RAW    0    // 1.024MHz
 #define AS7331_GAIN_X      (1 << (11 - AS7331_GAIN_RAW))
 #define AS7331_CONV_MS     (1 << AS7331_TIME_RAW)
 #define AS7331_CCLK_HZ     (1024.0f * (1 << AS7331_CCLK_RAW))
 
-// フルスケール分解能（チャンネル毎、データシート/SparkFun実装より）
 #define AS7331_FSR_UVA     348160.0f
 #define AS7331_FSR_UVB     387072.0f
 #define AS7331_FSR_UVC     169984.0f
-
-// 測定モード enum: CONT=0, CMD=1, SYNS=2, SYND=3
 #define AS7331_MEAS_CMD    1
 
-// Config レジスタ
 #define AS7331_REG_CFG_OSR     0x00
 #define AS7331_REG_CFG_AGEN    0x02
 #define AS7331_REG_CFG_CREG1   0x06
@@ -97,18 +167,14 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define AS7331_REG_CFG_BREAK   0x09
 #define AS7331_REG_CFG_EDGES   0x0A
 #define AS7331_REG_CFG_OPTREG  0x0B
+#define AS7331_REG_MRES1       0x02
 
-// Measure レジスタ
-#define AS7331_REG_MRES1       0x02  // UVA (16-bit LE)
-#define AS7331_REG_MRES2       0x03  // UVB
-#define AS7331_REG_MRES3       0x04  // UVC
-
-// OSR ビット: dos[2:0], sw_res[3], pd[6], ss[7]
 #define AS7331_OPMODE_CFG      0x02
 #define AS7331_OPMODE_MEAS     0x03
-
-// この値未満のブランク信号は異常（汚れ/未設置/結線ミス）とみなす [µW/cm²]
 #define AS7331_MIN_UV          0.5f
+
+#define LED_PWM 255
+#define CALIB_MS 300
 
 static bool as7331WriteReg(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(AS7331_ADDR);
@@ -120,67 +186,49 @@ static bool as7331WriteReg(uint8_t reg, uint8_t val) {
 static bool as7331ReadRegs(uint8_t reg, uint8_t* buf, uint8_t len) {
   Wire.beginTransmission(AS7331_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;          // repeated start
+  if (Wire.endTransmission(false) != 0) return false;
   if (Wire.requestFrom((uint8_t)AS7331_ADDR, len) != len) return false;
   for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
   return true;
 }
 
-// 生カウント -> µW/cm² （CMD/CONT/SYNS モード: 式3）
 static float as7331CountsToUwCm2(uint16_t raw, float fsr) {
   float factor = fsr / ((float)AS7331_GAIN_X * (float)AS7331_CONV_MS * AS7331_CCLK_HZ);
   return (float)raw * factor;
 }
 
-// ソフトウェアリセット後、CFGモードで設定を書き込み、MEASモードへ移行する
 static bool as7331Begin() {
-  // OSRはどの動作モードでも書けるので、まずCFGモード・パワーダウンへ寄せる
   as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_CFG | (1 << 6));
   delay(1);
-
-  // AGEN レジスタでデバイスID確認（デバイスID上位ニブル = 0x2）
   uint8_t osr = 0;
   if (!as7331ReadRegs(AS7331_REG_CFG_AGEN, &osr, 1)) return false;
   if ((osr & 0xF0) != 0x20) return false;
-
-  // ソフトウェアリセット
   if (!as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_CFG | (1 << 6) | 0x08)) return false;
   delay(10);
-
-  // CFGモード・パワーダウン
   if (!as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_CFG | (1 << 6))) return false;
   delay(1);
 
-  // CREG1: gain[7:4], time[3:0]
   uint8_t creg1 = (uint8_t)((AS7331_GAIN_RAW << 4) | (AS7331_TIME_RAW & 0x0F));
-  // CREG2: デジタル分周なし / SYND温度変換は未使用
   uint8_t creg2 = 0x00;
-  // CREG3: mmode[7:6]=CMD, cclk[1:0]
   uint8_t creg3 = (uint8_t)((AS7331_MEAS_CMD << 6) | (AS7331_CCLK_RAW & 0x03));
 
   if (!as7331WriteReg(AS7331_REG_CFG_CREG1, creg1)) return false;
   if (!as7331WriteReg(AS7331_REG_CFG_CREG2, creg2)) return false;
   if (!as7331WriteReg(AS7331_REG_CFG_CREG3, creg3)) return false;
-  if (!as7331WriteReg(AS7331_REG_CFG_BREAK, 25)) return false;  // 25*8us=200us
+  if (!as7331WriteReg(AS7331_REG_CFG_BREAK, 25)) return false;
   if (!as7331WriteReg(AS7331_REG_CFG_EDGES, 1)) return false;
-  if (!as7331WriteReg(AS7331_REG_CFG_OPTREG, 0x01)) return false; // repeat start有効
-
-  // MEASモード・パワーアップ（ss=0: まだ開始しない）
-  osr = AS7331_OPMODE_MEAS;  // pd=0, ss=0
-  if (!as7331WriteReg(AS7331_REG_CFG_OSR, osr)) return false;
-
+  if (!as7331WriteReg(AS7331_REG_CFG_OPTREG, 0x01)) return false;
+  if (!as7331WriteReg(AS7331_REG_CFG_OSR, AS7331_OPMODE_MEAS)) return false;
   return true;
 }
 
-// ワンショット変換を開始（ss=1）
 static bool as7331Start() {
   uint8_t osr = 0;
   if (!as7331ReadRegs(AS7331_REG_CFG_OSR, &osr, 1)) return false;
-  osr |= (1 << 7);  // start state
+  osr |= (1 << 7);
   return as7331WriteReg(AS7331_REG_CFG_OSR, osr);
 }
 
-// UVA/UVB/UVC の生カウントを読み出す（連続6バイト, 16-bit LE）
 static bool as7331ReadUV(uint16_t& uva, uint16_t& uvb, uint16_t& uvc) {
   uint8_t b[6];
   if (!as7331ReadRegs(AS7331_REG_MRES1, b, sizeof(b))) return false;
@@ -190,105 +238,23 @@ static bool as7331ReadUV(uint16_t& uva, uint16_t& uvb, uint16_t& uvc) {
   return true;
 }
 
-const float REF_CONCENTRATION = 50.0; // dsDNA [ug/mL] @ A260=1.0 (1cm pathlength)
+void ledOn(int pin)  { analogWrite(pin, LED_PWM); }
+void ledOff(int pin) { analogWrite(pin, 0); }
 
-// ---- 校正用固定真値（濃度固定、ユーザ入力なし）----
-const float DNA_TRUE_A260 = 1.0f;   // 50ug/mL DNA
-const float DNA_TRUE_A280 = 0.47f;
-const float PROT_TRUE_A260 = 0.074f; // 1% (w/v) protein
-const float PROT_TRUE_A280 = 0.13f;
-
-// ============================================================
-// 校正係数（校正モードで既知標準から算出し、ここに反映する）
-//   デフォルト: k=1, b=0 （未校正）。実測後に上書き。
-// ============================================================
-const float K260 = 1.0f; // A260 スケール因子（デフォルト/未校正）
-const float B260 = 0.0f; // A260 オフセット
-const float K280 = 1.0f; // A280 スケール因子
-const float B280 = 0.0f; // A280 オフセット
-
-// ---- 実行時校正係数（EEPROM読み込みで上書き。runMeasure はこれを使う）----
-float gK260 = 1.0f, gB260 = 0.0f, gK280 = 1.0f, gB280 = 0.0f;
-
-// ============================================================
-// EEPROM保存用（LGT8F328P内蔵実物EEPROM、約1KB使用可）
-//   アップロード毎に消去されるため、有効性判定用のマジック番号を持つ。
-// ============================================================
-#define CALIB_EEPROM_ADDR 0
-#define CALIB_MAGIC       0x4E414E4F // "NANO"
-#define CALIB_VERSION     1
-
-struct CalibData {
-  uint32_t magic;   // マジック番号（有効性判定）
-  uint8_t  version; // バージョン
-  float    k260, b260, k280, b280; // 校正係数
-  uint32_t checksum; // 簡易チェックサム
-} __attribute__((packed));
-
-void saveCalibration(float k260, float b260, float k280, float b280);
-bool loadCalibration(float& k260, float& b260, float& k280, float& b280);
-
-// ============================================================
-// 前方宣言
-// ============================================================
-void printScreen(const char* line1, const char* line2);
-void showCalibResult(float k260, float b260, float k280, float b280);
-void showResult(float a260, float a280, float ratio, float conc);
-void runMeasure();
-void runCalibration();
-float measureUV(int ledPin);
-
-volatile bool armPressed = false;   // アームスイッチ割込フラグ
-unsigned long lastArmTime = 0;      // デバウンス用
-
-// ---- 通常測定の状態機械（指示付き：ブランク → サンプルの2段階）----
-//   アームスイッチを1回押すたびに1ステップ進行する。
-//     1) "PUT BLANK 1/2" でブランク(I0)を測定し、アームを押す
-//     2) "SWAP SAMPLE 2/2" でサンプルに換えてアームを押す → 結果表示
-//       size1: A260/A280 + Purity, size2: Conc=xx.x（大きく）, size1: "next: set BLANK"
-//   結果はアーム押下までOLEDに保持。次のアームで自動的に次のブランク測定へ。
-enum MeasureState { M_DO_I0, M_DO_I };
-static MeasureState mState = M_DO_I0;   // 起動時はすぐにブランク測定可能
-static bool measuring = false;          // 実行中の追加割込防止
-static float g_i0_265 = 0.0f, g_i0_280 = 0.0f; // ブランク（I0）を保持
-
-// ---- アームスイッチ割込 ----
-// マクロ: FALLING（押した時）/ ホール: RISING（磁石が近づいた時）に1回だけ測定
-void armISR() {
-  unsigned long now = millis();
-  if (now - lastArmTime > ARM_DEBounce) {
-    armPressed = true;
-    lastArmTime = now;
-  }
-}
-
-// ---- LED制御 ----
-void ledOn(int pin, int pwm) { analogWrite(pin, pwm); }
-void ledOff(int pin)         { analogWrite(pin, 0); }
-
-// 指定LEDを点灯し、安定後にAS7331でワンショット測定して µW/cm² を返す。
-//   265nm LED -> UVC チャンネル / 280nm LED -> UVB チャンネル
-//   I2C/デバイスエラー時は -1.0f を返す。
+// 指定LEDを点灯し AS7331 でワンショット測定。µW/cm² を返す（エラーは -1）。
 float measureUV(int ledPin) {
-  ledOn(ledPin, LED_PWM);
+  ledOn(ledPin);
   delay(CALIB_MS);
-
-  if (!as7331Start()) {
-    ledOff(ledPin);
-    return -1.0f;
-  }
-  delay(AS7331_CONV_MS + 2);   // 変換完了待ち（コンバージョン時間 + 余裕）
-
+  if (!as7331Start()) { ledOff(ledPin); return -1.0f; }
+  delay(AS7331_CONV_MS + 2);
   uint16_t uva, uvb, uvc;
   bool ok = as7331ReadUV(uva, uvb, uvc);
   ledOff(ledPin);
   if (!ok) return -1.0f;
-
   if (ledPin == LED_265_PIN) return as7331CountsToUwCm2(uvc, AS7331_FSR_UVC);
   return as7331CountsToUwCm2(uvb, AS7331_FSR_UVB);
 }
 
-// 生吸光度 A_meas = -log10(I/I0)
 float computeAbsorbance(float i, float i0) {
   if (i0 <= AS7331_MIN_UV) return 9.99f;
   if (i < 0.0f) return 9.99f;
@@ -297,357 +263,758 @@ float computeAbsorbance(float i, float i0) {
   return -10.0f * log10(ratio);
 }
 
-// 校正適用: A_true = k*A_meas + b
-float calibrate(float a, float k, float b) {
-  return k * a + b;
+float calibrate(float a, float k, float b) { return k * a + b; }
+
+// ============================================================
+// 測定データ (メモリ保持) + CSV
+// ============================================================
+#define MAX_RECORDS 50
+struct Record { float a260, a280, ratio, conc; };
+Record records[MAX_RECORDS];
+int recordCount = 0;
+
+String buildCsv() {
+  String csv = "index,A260,A280,Purity,Conc_ug_ml\n";
+  for (int i = 0; i < recordCount; i++) {
+    csv += String(i + 1) + ",";
+    csv += String(records[i].a260, 3) + ",";
+    csv += String(records[i].a280, 3) + ",";
+    csv += String(records[i].ratio, 3) + ",";
+    csv += String(records[i].conc, 2) + "\n";
+  }
+  return csv;
 }
 
+// ============================================================
+// Web サーバ
+// ============================================================
+String currentIPString() {
+  if (WiFi.getMode() & WIFI_MODE_AP) return WiFi.softAPIP().toString();
+  if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+  return String("0.0.0.0");
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>DIY Nanodrop</title></head><body style='font-family:sans-serif;margin:24px'>";
+  html += "<h1>DIY Nanodrop</h1>";
+  html += "<p>Records: <b>" + String(recordCount) + "</b></p>";
+  html += "<p><a href='/data.csv' style='font-size:20px'>Download data.csv</a></p>";
+  html += "<p style='color:#888'>Keep this page open over the device WiFi.</p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleCsv() {
+  String csv = buildCsv();
+  server.sendHeader("Content-Disposition", "attachment; filename=data.csv");
+  server.send(200, "text/csv", csv);
+}
+
+void setupServer() {
+  server.on("/", handleRoot);
+  server.on("/data.csv", handleCsv);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+// ============================================================
+// WiFi
+// ============================================================
+void startAP() {
+  WiFi.mode(WIFI_AP);
+  IPAddress ip(192, 168, 5, 1), gw(192, 168, 5, 1), sn(255, 255, 255, 0);
+  WiFi.softAPConfig(ip, gw, sn);
+  WiFi.softAP(AP_SSID, AP_PASS);
+}
+
+void wifiBoot() {
+  if (cfg.wifiValid && cfg.ssid[0]) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(cfg.ssid, cfg.pass);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(100);
+    if (WiFi.status() == WL_CONNECTED) return;
+  }
+  startAP();
+}
+
+// ============================================================
+// UI 基盤
+// ============================================================
+enum Screen {
+  SCR_HOME,
+  SCR_CAL_CHECK_OK,
+  SCR_CAL_ASK,
+  SCR_CAL_INTRO,
+  SCR_CAL_BLANK,
+  SCR_CAL_DNA,
+  SCR_CAL_PROT,
+  SCR_CAL_DONE,
+  SCR_MEAS_BLANK,
+  SCR_MEAS_SAMPLE,
+  SCR_MEAS_RESULT,
+  SCR_SETTINGS,
+  SCR_BRIGHT,
+  SCR_WIFI,
+  SCR_WIFI_SCAN,
+  SCR_WIFI_LIST,
+  SCR_WIFI_WPS,
+  SCR_WIFI_DONE,
+  SCR_TOUCHCAL,
+  SCR_DOWNLOAD,
+  SCR_MSG
+};
+
+Screen screen = SCR_HOME;
+Screen msgReturn = SCR_HOME;
+Screen screenReturn = SCR_HOME;   // Download の戻り先
+char msg1[40] = {0}, msg2[40] = {0};
+
+int wifiCount = 0;
+int wifiSel = -1;
+int touchCalStep = 0;
+
+void wifiStartScan();
+void wifiRunWps();
+
+void clearScreen() { display.fillScreen(COL_BG); }
+
+void centerText(const char* s, int y, uint8_t size, uint16_t color) {
+  display.setTextSize(size);
+  display.setTextColor(color);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_W - (int16_t)w) / 2 - x1, y);
+  display.print(s);
+}
+
+void drawButton(int x, int y, int w, int h, const char* label,
+                uint16_t bg = COL_BTN, uint8_t textSize = 2) {
+  display.fillRoundRect(x, y, w, h, 8, bg);
+  display.drawRoundRect(x, y, w, h, 8, COL_FG);
+  display.setTextSize(textSize);
+  display.setTextColor(COL_FG);
+  int16_t x1, y1; uint16_t ww, hh;
+  display.getTextBounds(label, 0, 0, &x1, &y1, &ww, &hh);
+  display.setCursor(x + (w - (int16_t)ww) / 2 - x1, y + (h - (int16_t)hh) / 2 - y1);
+  display.print(label);
+}
+
+bool inRect(int x, int y, int rx, int ry, int rw, int rh) {
+  return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+}
+
+// ---- ホーム ----
+#define HOME_X 30
+#define HOME_W 260
+#define HOME_H 46
+#define HOME_CAL_Y 50
+#define HOME_MEA_Y 102
+#define HOME_SET_Y 154
+#define DL_X 8
+#define DL_Y 210
+#define DL_W 304
+#define DL_H 24
+
+void renderHome() {
+  clearScreen();
+  centerText("DIY Nanodrop", 6, 3, COL_ACCENT);
+  drawButton(HOME_X, HOME_CAL_Y, HOME_W, HOME_H, "Calibration", COL_BTN, 3);
+  drawButton(HOME_X, HOME_MEA_Y, HOME_W, HOME_H, "Measuring", COL_BTN, 3);
+  drawButton(HOME_X, HOME_SET_Y, HOME_W, HOME_H, "Settings", COL_BTN2, 3);
+  drawButton(DL_X, DL_Y, DL_W, DL_H, "Download data", 0x4208, 2);
+}
+
+void renderDownload() {
+  clearScreen();
+  centerText("Download data", 6, 3, COL_ACCENT);
+  centerText("Connect to this WiFi and", 54, 2, COL_FG);
+  String ip = currentIPString();
+  String url = "http://" + ip + "/data.csv";
+  centerText(url.c_str(), 84, 2, COL_OK);
+  centerText("Records stored:", 120, 2, COL_FG);
+  centerText(String(recordCount).c_str(), 144, 3, COL_FG);
+  if (WiFi.getMode() & WIFI_MODE_AP) {
+    centerText("AP:", 180, 1, COL_WARN);
+    centerText((String(AP_SSID) + " / " + AP_PASS).c_str(), 194, 1, COL_WARN);
+  }
+  drawButton(110, 210, 100, 24, "Back", COL_BTN2, 2);
+}
+
+void showDownload(Screen from) {
+  screenReturn = from;
+  screen = SCR_DOWNLOAD;
+  renderDownload();
+}
+
+void showMessage(const char* l1, const char* l2, Screen ret) {
+  msgReturn = ret;
+  strncpy(msg1, l1 ? l1 : "", sizeof(msg1) - 1); msg1[sizeof(msg1) - 1] = 0;
+  strncpy(msg2, l2 ? l2 : "", sizeof(msg2) - 1); msg2[sizeof(msg2) - 1] = 0;
+  screen = SCR_MSG;
+  clearScreen();
+  if (l1) centerText(l1, 70, 2, COL_FG);
+  if (l2) centerText(l2, 110, 2, COL_FG);
+  drawButton(110, 170, 100, 44, "OK", COL_BTN, 3);
+}
+
+// ============================================================
+// 校正フロー
+// ============================================================
+const float DNA_TRUE_A260 = 1.0f;
+const float DNA_TRUE_A280 = 0.47f;
+const float PROT_TRUE_A260 = 0.074f;
+const float PROT_TRUE_A280 = 0.13f;
+
+float cal_i0_265 = 0, cal_i0_280 = 0;
+float cal_dna260 = 0, cal_dna280 = 0;
+float cal_prot260 = 0, cal_prot280 = 0;
+
+void renderCalCheckOk() {
+  clearScreen();
+  centerText("Calibration", 6, 3, COL_ACCENT);
+  centerText("Calibration data found", 54, 2, COL_OK);
+  char b[40];
+  snprintf(b, sizeof(b), "K260=%.4f B260=%.4f", cfg.k260, cfg.b260);
+  centerText(b, 86, 1, COL_FG);
+  snprintf(b, sizeof(b), "K280=%.4f B280=%.4f", cfg.k280, cfg.b280);
+  centerText(b, 102, 1, COL_FG);
+  drawButton(30, 150, 130, 50, "Re-calibrate", COL_BTN, 2);
+  drawButton(175, 150, 115, 50, "Back", COL_BTN2, 2);
+}
+
+void renderCalAsk() {
+  clearScreen();
+  centerText("Calibration", 6, 3, COL_ACCENT);
+  centerText("No calibration data", 60, 2, COL_WARN);
+  centerText("Configure now?", 96, 2, COL_FG);
+  drawButton(40, 150, 100, 54, "Yes", COL_OK, 3);
+  drawButton(180, 150, 100, 54, "No", COL_BTN2, 3);
+}
+
+void renderCalIntro() {
+  clearScreen();
+  centerText("Calibration", 6, 3, COL_ACCENT);
+  centerText("Standards needed:", 50, 2, COL_FG);
+  centerText("DNA: 50 ug/mL  (A260)", 82, 2, COL_ACCENT);
+  centerText("Protein: 1% w/v  (A280)", 108, 2, COL_ACCENT);
+  centerText("Follow the steps shown", 140, 1, COL_FG);
+  centerText("on screen. Keep blank ready.", 154, 1, COL_FG);
+  drawButton(90, 186, 140, 44, "Start", COL_OK, 3);
+}
+
+void renderCalStep(const char* title, const char* label, const char* hint) {
+  clearScreen();
+  centerText("Calibration", 6, 2, COL_ACCENT);
+  centerText(title, 44, 3, COL_FG);
+  if (hint) centerText(hint, 100, 2, COL_WARN);
+  centerText(label, 140, 2, COL_FG);
+  drawButton(70, 180, 180, 48, "Measure", COL_OK, 3);
+}
+
+void renderCalDone() {
+  clearScreen();
+  centerText("Calibration", 6, 3, COL_ACCENT);
+  centerText("Saved to EEPROM", 50, 2, COL_OK);
+  char b[40];
+  snprintf(b, sizeof(b), "K260=%.4f", cfg.k260); centerText(b, 88, 2, COL_FG);
+  snprintf(b, sizeof(b), "B260=%.4f", cfg.b260); centerText(b, 110, 2, COL_FG);
+  snprintf(b, sizeof(b), "K280=%.4f", cfg.k280); centerText(b, 132, 2, COL_FG);
+  snprintf(b, sizeof(b), "B280=%.4f", cfg.b280); centerText(b, 154, 2, COL_FG);
+  drawButton(110, 190, 100, 40, "OK", COL_BTN, 3);
+}
+
+void runCalBlank() {
+  showMessage("Measuring BLANK", "please wait...", SCR_CAL_DNA);
+  // 画面更新後に測定
+  cal_i0_265 = measureUV(LED_265_PIN);
+  cal_i0_280 = measureUV(LED_280_PIN);
+  if (cal_i0_265 < AS7331_MIN_UV || cal_i0_280 < AS7331_MIN_UV) {
+    showMessage("BLANK too low", "check cell/wiring", SCR_CAL_BLANK);
+    return;
+  }
+  screen = SCR_CAL_DNA;
+  renderCalStep("Step 2/3  DNA", "Apply 50 ug/mL DNA", "then tap Measure");
+}
+
+void runCalDna() {
+  showMessage("Measuring DNA", "please wait...", SCR_CAL_PROT);
+  float d265 = measureUV(LED_265_PIN);
+  float d280 = measureUV(LED_280_PIN);
+  cal_dna260 = computeAbsorbance(d265, cal_i0_265);
+  cal_dna280 = computeAbsorbance(d280, cal_i0_280);
+  screen = SCR_CAL_PROT;
+  renderCalStep("Step 3/3  Protein", "Apply 1% w/v protein", "then tap Measure");
+}
+
+void runCalProt() {
+  showMessage("Measuring Protein", "please wait...", SCR_CAL_DONE);
+  float p265 = measureUV(LED_265_PIN);
+  float p280 = measureUV(LED_280_PIN);
+  cal_prot260 = computeAbsorbance(p265, cal_i0_265);
+  cal_prot280 = computeAbsorbance(p280, cal_i0_280);
+
+  float denom260 = cal_dna260 - cal_prot260;
+  float denom280 = cal_dna280 - cal_prot280;
+  if (fabsf(denom260) < 1e-4f || fabsf(denom280) < 1e-4f) {
+    showMessage("Calibration failed", "standards too close", SCR_HOME);
+    return;
+  }
+  cfg.k260 = (PROT_TRUE_A260 - DNA_TRUE_A260) / denom260;
+  cfg.b260 = DNA_TRUE_A260 - cfg.k260 * cal_dna260;
+  cfg.k280 = (PROT_TRUE_A280 - DNA_TRUE_A280) / denom280;
+  cfg.b280 = DNA_TRUE_A280 - cfg.k280 * cal_dna280;
+  cfg.calibValid = 1;
+  saveConfig();
+
+  Serial.printf("CAL RESULT K260=%.6f B260=%.6f K280=%.6f B280=%.6f\n",
+                cfg.k260, cfg.b260, cfg.k280, cfg.b280);
+  screen = SCR_CAL_DONE;
+  renderCalDone();
+}
+
+// ============================================================
+// 測定フロー
+// ============================================================
+float meas_i0_265 = 0, meas_i0_280 = 0;
+
+void renderMeasBlank() {
+  clearScreen();
+  centerText("Measuring", 4, 2, COL_ACCENT);
+  centerText("Apply BLANK", 40, 3, COL_FG);
+  centerText("(pure solvent)", 84, 2, COL_FG);
+  centerText("then tap Measure", 116, 2, COL_WARN);
+  drawButton(70, 160, 180, 48, "Measure BLANK", COL_OK, 2);
+  drawButton(DL_X, DL_Y, DL_W, DL_H, "Download data", 0x4208, 2);
+}
+
+void renderMeasSample() {
+  clearScreen();
+  centerText("Measuring", 4, 2, COL_ACCENT);
+  centerText("Apply SAMPLE", 40, 3, COL_FG);
+  centerText("then tap Measure", 100, 2, COL_WARN);
+  drawButton(70, 160, 180, 48, "Measure SAMPLE", COL_OK, 2);
+  drawButton(DL_X, DL_Y, DL_W, DL_H, "Download data", 0x4208, 2);
+}
+
+void renderMeasResult() {
+  clearScreen();
+  centerText("Result", 4, 2, COL_ACCENT);
+  if (recordCount == 0) { centerText("no data", 100, 2, COL_FG); return; }
+  Record& r = records[recordCount - 1];
+  char b[44];
+  snprintf(b, sizeof(b), "A260=%.3f  A280=%.3f", r.a260, r.a280);
+  centerText(b, 34, 2, COL_FG);
+  snprintf(b, sizeof(b), "Purity=%.2f", r.ratio);
+  centerText(b, 58, 2, COL_FG);
+  snprintf(b, sizeof(b), "Conc=%.1f ug/mL", r.conc);
+  centerText(b, 88, 3, COL_OK);
+  centerText("Before next sample:", 130, 1, COL_FG);
+  centerText("apply BLANK again", 144, 1, COL_WARN);
+  drawButton(10, 170, 150, 34, "Next: BLANK", COL_BTN, 2);
+  drawButton(168, 170, 142, 34, "Download data", 0x4208, 2);
+}
+
+void runMeasBlank() {
+  showMessage("Measuring BLANK", "please wait...", SCR_MEAS_SAMPLE);
+  meas_i0_265 = measureUV(LED_265_PIN);
+  meas_i0_280 = measureUV(LED_280_PIN);
+  if (meas_i0_265 < AS7331_MIN_UV || meas_i0_280 < AS7331_MIN_UV) {
+    showMessage("BLANK too low", "check cell/wiring", SCR_MEAS_BLANK);
+    return;
+  }
+  screen = SCR_MEAS_SAMPLE;
+  renderMeasSample();
+}
+
+void runMeasSample() {
+  showMessage("Measuring SAMPLE", "please wait...", SCR_MEAS_RESULT);
+  float i265 = measureUV(LED_265_PIN);
+  float i280 = measureUV(LED_280_PIN);
+  float a260m = computeAbsorbance(i265, meas_i0_265);
+  float a280m = computeAbsorbance(i280, meas_i0_280);
+  float a260 = calibrate(a260m, cfg.k260, cfg.b260);
+  float a280 = calibrate(a280m, cfg.k280, cfg.b280);
+  float ratio = (a280 > 0.001f) ? a260 / a280 : 99.9f;
+  float conc = a260 * 50.0f;  // dsDNA ug/mL
+
+  if (recordCount < MAX_RECORDS) {
+    records[recordCount++] = { a260, a280, ratio, conc };
+  }
+  Serial.printf("SAMPLE A260=%.3f A280=%.3f Ratio=%.3f Conc=%.1f\n",
+                a260, a280, ratio, conc);
+  screen = SCR_MEAS_RESULT;
+  renderMeasResult();
+}
+
+// ============================================================
+// 設定
+// ============================================================
+void renderSettings() {
+  clearScreen();
+  centerText("Settings", 6, 3, COL_ACCENT);
+  drawButton(20, 48, 280, 40, "Brightness", COL_BTN, 2);
+  drawButton(20, 94, 280, 40, "WiFi settings", COL_BTN, 2);
+  drawButton(20, 140, 280, 40, "Touch calibration", COL_BTN2, 2);
+  drawButton(20, 186, 200, 40, "Initialize WiFi", COL_ERR, 2);
+  drawButton(230, 186, 70, 40, "Back", COL_BTN2, 2);
+}
+
+#define SET_BRIGHT_Y 48
+#define SET_WIFI_Y 94
+#define SET_TOUCH_Y 140
+#define SET_INIT_Y 186
+
+void renderBrightness() {
+  clearScreen();
+  centerText("Brightness", 6, 3, COL_ACCENT);
+  char b[24];
+  snprintf(b, sizeof(b), "%d", cfg.brightness);
+  centerText(b, 80, 4, COL_FG);
+  drawButton(40, 150, 80, 50, "-", COL_BTN, 3);
+  drawButton(200, 150, 80, 50, "+", COL_BTN, 3);
+  drawButton(120, 150, 80, 50, "OK", COL_OK, 3);
+}
+
+void renderWifiInfo() {
+  clearScreen();
+  centerText("WiFi", 6, 3, COL_ACCENT);
+  if (cfg.wifiValid && WiFi.status() == WL_CONNECTED) {
+    centerText("Connected (STA)", 48, 2, COL_OK);
+    centerText(cfg.ssid, 82, 2, COL_FG);
+    centerText(WiFi.localIP().toString().c_str(), 110, 2, COL_FG);
+  } else if (WiFi.getMode() & WIFI_MODE_AP) {
+    centerText("AP mode", 48, 2, COL_WARN);
+    centerText((String("SSID: ") + AP_SSID).c_str(), 80, 2, COL_FG);
+    centerText((String("pass: ") + AP_PASS).c_str(), 106, 2, COL_FG);
+    centerText("IP: 192.168.5.1", 132, 2, COL_FG);
+  } else {
+    centerText("Not connected", 60, 2, COL_WARN);
+  }
+  drawButton(20, 176, 170, 48, "Scan & WPS", COL_BTN, 2);
+  drawButton(200, 176, 100, 48, "Back", COL_BTN2, 2);
+}
+
+void renderWifiScan() {
+  clearScreen();
+  centerText("WiFi", 6, 3, COL_ACCENT);
+  centerText("Scanning...", 90, 3, COL_FG);
+}
+
+void renderWifiList() {
+  clearScreen();
+  centerText("Select SSID", 4, 2, COL_ACCENT);
+  int total = 0;
+  int shown = 0;
+  // WiFi.SSID は scan 後有効
+  for (int i = 0; i < wifiCount && shown < 6; i++, shown++) {
+    int y = 30 + shown * 30;
+    String s = WiFi.SSID(i);
+    if (s.length() > 26) s = s.substring(0, 26);
+    char label[40];
+    snprintf(label, sizeof(label), "%s", s.c_str());
+    drawButton(8, y, 304, 26, label, (i == wifiSel ? COL_OK : COL_BTN),
+               s.length() > 16 ? 1 : 2);
+    total++;
+  }
+  drawButton(8, 210, 100, 24, "Back", COL_BTN2, 2);
+}
+
+void renderWifiWps() {
+  clearScreen();
+  centerText("WPS", 6, 3, COL_ACCENT);
+  centerText("Press the WPS button", 70, 2, COL_FG);
+  centerText("on your router now.", 96, 2, COL_FG);
+  centerText("Connecting automatically...", 140, 2, COL_WARN);
+}
+
+void renderWifiDone(bool ok) {
+  clearScreen();
+  centerText("WiFi", 6, 3, COL_ACCENT);
+  if (ok) {
+    centerText("Connected!", 60, 3, COL_OK);
+    centerText(cfg.ssid, 106, 2, COL_FG);
+    centerText(WiFi.localIP().toString().c_str(), 132, 2, COL_FG);
+  } else {
+    centerText("WPS failed", 70, 3, COL_ERR);
+    centerText("Check router WPS", 116, 2, COL_FG);
+  }
+  drawButton(110, 180, 100, 44, "OK", COL_BTN, 3);
+}
+
+void renderTouchCal(int step) {
+  clearScreen();
+  centerText("Touch calibration", 6, 2, COL_ACCENT);
+  if (step == 1) centerText("Tap the TOP-LEFT target", 70, 2, COL_FG);
+  else centerText("Tap the BOTTOM-RIGHT target", 70, 2, COL_FG);
+  int tx = (step == 1) ? 20 : SCREEN_W - 20;
+  int ty = (step == 1) ? 20 : SCREEN_H - 20;
+  display.drawLine(tx - 12, ty, tx + 12, ty, COL_ERR);
+  display.drawLine(tx, ty - 12, tx, ty + 12, COL_ERR);
+  display.drawCircle(tx, ty, 8, COL_ERR);
+}
+
+// ============================================================
+// タッチ割当 (画面座標)
+// ============================================================
+void handleTouchCalRaw(int rx, int ry) {
+  static int rawX1, rawY1;
+  if (touchCalStep == 1) {
+    rawX1 = rx; rawY1 = ry;
+    touchCalStep = 2;
+    renderTouchCal(2);
+  } else if (touchCalStep == 2) {
+    cfg.tsMinX = (int16_t)rawX1; cfg.tsMaxX = (int16_t)rx;
+    cfg.tsMinY = (int16_t)rawY1; cfg.tsMaxY = (int16_t)ry;
+    if (cfg.tsMinX == cfg.tsMaxX) cfg.tsMaxX += 1;
+    if (cfg.tsMinY == cfg.tsMaxY) cfg.tsMaxY += 1;
+    saveConfig();
+    touchCalStep = 0;
+    showMessage("Touch calibrated", "saved", SCR_HOME);
+  }
+}
+
+void onTouch(int x, int y) {
+  switch (screen) {
+    case SCR_HOME:
+      if (inRect(x, y, DL_X, DL_Y, DL_W, DL_H)) { showDownload(SCR_HOME); }
+      else if (inRect(x, y, HOME_X, HOME_CAL_Y, HOME_W, HOME_H)) {
+        if (cfg.calibValid) { screen = SCR_CAL_CHECK_OK; renderCalCheckOk(); }
+        else { screen = SCR_CAL_ASK; renderCalAsk(); }
+      } else if (inRect(x, y, HOME_X, HOME_MEA_Y, HOME_W, HOME_H)) {
+        screen = SCR_MEAS_BLANK; renderMeasBlank();
+      } else if (inRect(x, y, HOME_X, HOME_SET_Y, HOME_W, HOME_H)) {
+        screen = SCR_SETTINGS; renderSettings();
+      }
+      break;
+
+    case SCR_CAL_CHECK_OK:
+      if (inRect(x, y, 30, 150, 130, 50)) { screen = SCR_CAL_INTRO; renderCalIntro(); }
+      else if (inRect(x, y, 175, 150, 115, 50)) { screen = SCR_HOME; renderHome(); }
+      break;
+
+    case SCR_CAL_ASK:
+      if (inRect(x, y, 40, 150, 100, 54)) { screen = SCR_CAL_INTRO; renderCalIntro(); }
+      else if (inRect(x, y, 180, 150, 100, 54)) { screen = SCR_HOME; renderHome(); }
+      break;
+
+    case SCR_CAL_INTRO:
+      if (inRect(x, y, 90, 186, 140, 44)) {
+        screen = SCR_CAL_BLANK;
+        renderCalStep("Step 1/3  BLANK", "Apply BLANK (pure solvent)", "then tap Measure");
+      }
+      break;
+
+    case SCR_CAL_BLANK:
+      if (inRect(x, y, 70, 180, 180, 48)) runCalBlank();
+      break;
+    case SCR_CAL_DNA:
+      if (inRect(x, y, 70, 180, 180, 48)) runCalDna();
+      break;
+    case SCR_CAL_PROT:
+      if (inRect(x, y, 70, 180, 180, 48)) runCalProt();
+      break;
+    case SCR_CAL_DONE:
+      if (inRect(x, y, 110, 190, 100, 40)) { screen = SCR_HOME; renderHome(); }
+      break;
+
+    case SCR_MEAS_BLANK:
+      if (inRect(x, y, DL_X, DL_Y, DL_W, DL_H)) { showDownload(SCR_MEAS_BLANK); }
+      else if (inRect(x, y, 70, 160, 180, 48)) runMeasBlank();
+      break;
+    case SCR_MEAS_SAMPLE:
+      if (inRect(x, y, DL_X, DL_Y, DL_W, DL_H)) { showDownload(SCR_MEAS_SAMPLE); }
+      else if (inRect(x, y, 70, 160, 180, 48)) runMeasSample();
+      break;
+    case SCR_MEAS_RESULT:
+      if (inRect(x, y, 10, 170, 150, 34)) { screen = SCR_MEAS_BLANK; renderMeasBlank(); }
+      else if (inRect(x, y, 168, 170, 142, 34)) { showDownload(SCR_MEAS_RESULT); }
+      break;
+
+    case SCR_SETTINGS:
+      if (inRect(x, y, 20, SET_BRIGHT_Y, 280, 40)) { screen = SCR_BRIGHT; renderBrightness(); }
+      else if (inRect(x, y, 20, SET_WIFI_Y, 280, 40)) { screen = SCR_WIFI; renderWifiInfo(); }
+      else if (inRect(x, y, 20, SET_TOUCH_Y, 280, 40)) { touchCalStep = 1; screen = SCR_TOUCHCAL; renderTouchCal(1); }
+      else if (inRect(x, y, 20, SET_INIT_Y, 200, 40)) {
+        cfg.wifiValid = 0; cfg.ssid[0] = 0; cfg.pass[0] = 0; saveConfig();
+        WiFi.disconnect(true, true);
+        startAP();
+        showMessage("WiFi settings cleared", "AP: mynanodrop", SCR_WIFI);
+      } else if (inRect(x, y, 230, SET_INIT_Y, 70, 40)) { screen = SCR_HOME; renderHome(); }
+      break;
+
+    case SCR_BRIGHT:
+      if (inRect(x, y, 40, 150, 80, 50)) {
+        cfg.brightness = (cfg.brightness > 20) ? cfg.brightness - 20 : 0;
+        applyBrightness(); renderBrightness();
+      } else if (inRect(x, y, 200, 150, 80, 50)) {
+        int v = cfg.brightness + 20; cfg.brightness = (v > 255) ? 255 : v;
+        applyBrightness(); renderBrightness();
+      } else if (inRect(x, y, 120, 150, 80, 50)) {
+        saveConfig(); screen = SCR_SETTINGS; renderSettings();
+      }
+      break;
+
+    case SCR_WIFI:
+      if (inRect(x, y, 20, 176, 170, 48)) { screen = SCR_WIFI_SCAN; renderWifiScan(); wifiStartScan(); }
+      else if (inRect(x, y, 200, 176, 100, 48)) { screen = SCR_SETTINGS; renderSettings(); }
+      break;
+
+    case SCR_WIFI_LIST:
+      if (inRect(x, y, 8, 210, 100, 24)) { screen = SCR_WIFI; renderWifiInfo(); break; }
+      for (int i = 0; i < wifiCount && i < 6; i++) {
+        int yy = 30 + i * 30;
+        if (inRect(x, y, 8, yy, 304, 26)) { wifiSel = i; wifiRunWps(); break; }
+      }
+      break;
+
+    case SCR_WIFI_DONE:
+      if (inRect(x, y, 110, 180, 100, 44)) { screen = SCR_WIFI; renderWifiInfo(); }
+      break;
+
+    case SCR_DOWNLOAD:
+      if (inRect(x, y, 110, 210, 100, 24)) {
+        screen = screenReturn;
+        if (screen == SCR_MEAS_BLANK) renderMeasBlank();
+        else if (screen == SCR_MEAS_SAMPLE) renderMeasSample();
+        else if (screen == SCR_MEAS_RESULT) renderMeasResult();
+        else { screen = SCR_HOME; renderHome(); }
+      }
+      break;
+
+    case SCR_MSG:
+      screen = msgReturn;
+      if (screen == SCR_HOME) renderHome();
+      else if (screen == SCR_SETTINGS) renderSettings();
+      else if (screen == SCR_WIFI) renderWifiInfo();
+      else if (screen == SCR_MEAS_BLANK) renderMeasBlank();
+      else if (screen == SCR_CAL_BLANK) renderCalStep("Step 1/3  BLANK", "Apply BLANK (pure solvent)", "then tap Measure");
+      else renderHome();
+      break;
+
+    default: break;
+  }
+}
+// ============================================================
+// WiFi 操作
+// ============================================================
+void wifiStartScan() {
+  if (WiFi.getMode() & WIFI_MODE_AP) WiFi.mode(WIFI_AP_STA);  // AP中でもスキャン可能に
+  WiFi.scanDelete();
+  wifiCount = WiFi.scanNetworks();
+  if (wifiCount < 0) wifiCount = 0;
+  wifiSel = -1;
+  screen = SCR_WIFI_LIST;
+  renderWifiList();
+}
+
+void wifiRunWps() {
+  screen = SCR_WIFI_WPS;
+  renderWifiWps();
+  WiFi.mode(WIFI_AP_STA);   // AP を維持したまま WPS
+  bool ok = WiFi.beginWPSConfig();
+  if (ok) {
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
+    ok = (WiFi.status() == WL_CONNECTED);
+  }
+  if (ok) {
+    String s = WiFi.SSID();
+    String p = WiFi.psk();
+    strncpy(cfg.ssid, s.c_str(), sizeof(cfg.ssid) - 1);
+    cfg.ssid[sizeof(cfg.ssid) - 1] = 0;
+    strncpy(cfg.pass, p.c_str(), sizeof(cfg.pass) - 1);
+    cfg.pass[sizeof(cfg.pass) - 1] = 0;
+    cfg.wifiValid = 1;
+    saveConfig();
+    Serial.printf("WPS OK ssid=%s\n", cfg.ssid);
+  } else {
+    Serial.println("WPS failed");
+  }
+  screen = SCR_WIFI_DONE;
+  renderWifiDone(ok);
+}
+
+// ============================================================
+// タッチ入力
+// ============================================================
+void pollTouch() {
+  static bool lastDown = false;
+  static unsigned long lastMs = 0;
+  bool down = ts.touched();
+  if (down && !lastDown && millis() - lastMs > 200) {
+    lastMs = millis();
+    TS_Point p = ts.getPoint();
+#if TOUCH_DEBUG
+    Serial.printf("TOUCH raw x=%d y=%d z=%d\n", p.x, p.y, p.z);
+#endif
+    if (screen == SCR_TOUCHCAL) {
+      handleTouchCalRaw(p.x, p.y);
+    } else {
+      int sx = map(p.x, cfg.tsMinX, cfg.tsMaxX, 0, SCREEN_W);
+      int sy = map(p.y, cfg.tsMinY, cfg.tsMaxY, 0, SCREEN_H);
+      sx = constrain(sx, 0, SCREEN_W - 1);
+      sy = constrain(sy, 0, SCREEN_H - 1);
+      onTouch(sx, sy);
+    }
+  }
+  lastDown = down;
+}
+
+// ============================================================
+// setup / loop
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 2000) {}   // USBシリアル待ち
+  delay(200);
+
+  pinMode(TFT_BL, OUTPUT);
+  analogWrite(TFT_BL, 200);
+
+  SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, TFT_CS);
+  display.init(240, 320);
+  display.setRotation(1);
+  display.fillScreen(COL_BG);
+  ts.begin();
+  ts.setRotation(1);
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadConfig();
+  applyBrightness();
 
   pinMode(LED_265_PIN, OUTPUT);
   pinMode(LED_280_PIN, OUTPUT);
-  pinMode(CALIB_BTN_PIN, INPUT);          // プルダウン（ボタン=VCC）
-#if ARM_USE_HALL
-  pinMode(ARM_SW_PIN, INPUT);             // ホール: 出力をそのまま読む（外付けプルダウン）
-#else
-  pinMode(ARM_SW_PIN, INPUT_PULLUP);      // マクロスイッチ: プルアップ、押下=LOW
-#endif
-
-#if ARM_USE_HALL
-  attachInterrupt(digitalPinToInterrupt(ARM_SW_PIN), armISR, RISING);   // 磁石でHIGH
-#else
-  attachInterrupt(digitalPinToInterrupt(ARM_SW_PIN), armISR, FALLING);  // 押下でLOW
-#endif
-
   digitalWrite(LED_265_PIN, LOW);
   digitalWrite(LED_280_PIN, LOW);
 
-  Wire.begin();
+  Wire.begin(I2C_SDA, I2C_SCL);
 
-#if USE_OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED not found");   // OLED無しでも測定は続行
+  // WiFi + Web サーバ
+  wifiBoot();
+  setupServer();
+
+  // AS7331
+  bool sensorOk = as7331Begin();
+  if (!sensorOk) {
+    Serial.println("AS7331 not found (0x74)");
+    showMessage("AS7331 not found", "check I2C wiring", SCR_HOME);
   } else {
-    display.display();
-    delay(200);
-  }
-#endif
-
-  // ---- AS7331 初期化 ----
-  if (!as7331Begin()) {
-    Serial.println("AS7331 not found (0x74) — check I2C wiring");
-    printScreen("AS7331 ERR", "check sensor");
-  } else {
-    Serial.println("AS7331 UV sensor ready (0x74)");
+    Serial.println("AS7331 ready");
   }
 
-  printScreen("PUT BLANK 1/2", "press arm...");
-  Serial.println("=== DIY Nanodrop (LGT8F328P + AS7331) ready ===");
+  Serial.print("WiFi IP: "); Serial.println(currentIPString());
+  Serial.printf("Calib valid=%d  brightness=%d\n", cfg.calibValid, cfg.brightness);
 
-  // ---- EEPROMから校正係数を読み込む（未保存ならデフォルト1.0/0.0）----
-  if (loadCalibration(gK260, gB260, gK280, gB280)) {
-    Serial.println("Loaded calibration from EEPROM:");
-    Serial.print("  K260="); Serial.print(gK260, 6);
-    Serial.print(" B260="); Serial.print(gB260, 6);
-    Serial.print(" | K280="); Serial.print(gK280, 6);
-    Serial.print(" B280="); Serial.println(gB280, 6);
-  } else {
-    Serial.println("No valid calibration in EEPROM (using defaults).");
+  if (sensorOk) {
+    screen = SCR_HOME;
+    renderHome();
   }
-
-  Serial.print("Calibration: K260="); Serial.print(gK260, 4);
-  Serial.print(" B260="); Serial.print(gB260, 4);
-  Serial.print(" | K280="); Serial.print(gK280, 4);
-  Serial.print(" B280="); Serial.println(gB280, 4);
-}
-
-void printScreen(const char* line1, const char* line2) {
-#if USE_OLED
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 10);
-  display.println(line1);
-  if (line2) { display.setCursor(0, 38); display.println(line2); }
-  display.display();
-#endif
-}
-
-// 測定結果表示（保持中も見やすく、Concを大きく、ヒントを表示）
-void showResult(float a260, float a280, float ratio, float conc) {
-#if USE_OLED
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-
-  // size1: A260/A280 (1行まとめ)
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("A260="); display.print(a260, 2);
-  display.print(" A280="); display.println(a280, 2);
-
-  // size1: Purity
-  display.setCursor(0, 10);
-  display.print("Purity="); display.println(ratio, 2);
-
-  // size2: Conc を大きく（小数1位）
-  display.setTextSize(2);
-  display.setCursor(0, 22);
-  display.print("Conc="); display.println(conc, 1);
-
-  // size1: ヒント
-  display.setTextSize(1);
-  display.setCursor(0, 48);
-  display.println("next: set BLANK");
-
-  display.display();
-#endif
-}
-
-// ---- 校正結果をOLEDへ多行表示（K/B係数を表示）----
-void showCalibResult(float k260, float b260, float k280, float b280) {
-#if USE_OLED
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("CAL OK");
-  display.println(String("K260=") + String(k260, 4));
-  display.println(String("B260=") + String(b260, 4));
-  display.println(String("K280=") + String(k280, 4));
-  display.println(String("B280=") + String(b280, 4));
-  display.display();
-#endif
-}
-
-// ---- 通常測定（状態機械：指示付き ブランク → サンプル）----
-//   アームスイッチを1回押すたびに1ステップ進行する。
-//     ステップ1: "PUT BLANK 1/2" でブランク(I0)を両波長で測定 → "SWAP SAMPLE 2/2"
-//     ステップ2: サンプルに換えてアームを押す → 結果を表示（アーム押下まで保持）
-//       size1: A260/A280 + Purity
-//       size2: Conc=xx.x （大きく）
-//       size1: next: set BLANK
-//     次のアームでブランクへ
-void runMeasure() {
-  if (measuring) return;   // 実行中に追加割込が入らないよう保護
-
-  if (mState == M_DO_I0) {
-    // ---- ステップ1: ブランク(I0)を両波長で測定 ----
-    measuring = true;
-    printScreen("PUT BLANK 1/2", "press arm...");
-    Serial.println("--- MEASURE: BLANK ---");
-
-    float i0_265 = measureUV(LED_265_PIN);
-    float i0_280 = measureUV(LED_280_PIN);
-    g_i0_265 = i0_265;
-    g_i0_280 = i0_280;
-
-    // 両ブランクが成立しているか確認（異常時はエラー表示）
-    if (i0_265 < AS7331_MIN_UV || i0_280 < AS7331_MIN_UV) {
-      printScreen("MEAS ERR", "check BLANK");
-      Serial.println("BLANK too low (or AS7331 I2C error) — check cuvette/window/wiring");
-      mState = M_DO_I0;
-      measuring = false;
-      return;
-    }
-
-    // 次のステップへ：サンプルに交換するよう指示
-    mState = M_DO_I;
-    printScreen("SWAP SAMPLE 2/2", "press arm...");
-    Serial.println("--- MEASURE: SAMPLE (swap cuvette) ---");
-  } else {
-    // ---- ステップ2: サンプルを両波長で測定し結果を表示 ----
-    measuring = true;
-    printScreen("MEASURING", "please wait...");
-    Serial.println("--- MEASURE: SAMPLE ---");
-
-    float i_265 = measureUV(LED_265_PIN);
-    float i_280 = measureUV(LED_280_PIN);
-
-    float a260_meas = computeAbsorbance(i_265, g_i0_265);
-    float a280_meas = computeAbsorbance(i_280, g_i0_280);
-
-    // 校正適用（EEPROM読み込み済みの実行時係数を使用）
-    float a260 = calibrate(a260_meas, gK260, gB260);
-    float a280 = calibrate(a280_meas, gK280, gB280);
-
-    // 純度比（kの比も掛ける）
-    float ratio = (a280 > 0.001f) ? a260 / a280 : 99.9f;
-    float conc  = a260 * REF_CONCENTRATION; // dsDNA ug/mL
-
-    showResult(a260, a280, ratio, conc);
-
-    Serial.print("A260=");  Serial.print(a260, 3);
-    Serial.print(" A280="); Serial.print(a280, 3);
-    Serial.print(" Ratio=");Serial.print(ratio, 3);
-    Serial.print(" Conc=");Serial.println(conc, 1);
-
-    // 結果画面を保持（次のアーム押下まで）。アームを押すと次の測定（ブランク）へ進む。
-    mState = M_DO_I0;
-    measuring = false;
-    Serial.println("--- RESULT HELD (press arm to continue) ---");
-  }
-}
-
-// ---- 校正モード（固定濃度・arm駆動）----
-//   順序: BLANK → 50ug/mL DNA → 1% protein
-//   真値は固定（濃度固定）。Serial入力不要。
-void runCalibration() {
-  Serial.println("=== CALIBRATION (fixed standards) ===");
-  armPressed = false;
-  mState = M_DO_I0;  // 安全のため測定状態をリセット
-
-  printScreen("CAL MODE", "arm to step");
-  delay(600);
-
-  // Step 1: BLANK
-  printScreen("CAL 1/3 BLANK", "blank + arm");
-  {
-    unsigned long t0 = millis();
-    while (!armPressed && (millis() - t0 < 60000)) delay(10);
-  }
-  if (!armPressed) { printScreen("CAL ERR", "timeout"); return; }
-  armPressed = false;
-
-  printScreen("CAL 1/3 BLANK", "measuring...");
-  Serial.println("--- CALIB: BLANK ---");
-  float i0_265 = measureUV(LED_265_PIN);
-  float i0_280 = measureUV(LED_280_PIN);
-
-  if (i0_265 < AS7331_MIN_UV || i0_280 < AS7331_MIN_UV) {
-    printScreen("CAL ERR", "check BLANK");
-    Serial.println("BLANK too low (or AS7331 I2C error) — check cuvette/window/wiring");
-    return;
-  }
-
-  // Step 2: DNA 50ug/mL
-  printScreen("CAL 2/3 DNA", "DNA + arm");
-  {
-    unsigned long t0 = millis();
-    while (!armPressed && (millis() - t0 < 60000)) delay(10);
-  }
-  if (!armPressed) { printScreen("CAL ERR", "timeout"); return; }
-  armPressed = false;
-
-  printScreen("CAL 2/3 DNA", "measuring...");
-  Serial.println("--- CALIB: DNA ---");
-  float d_265 = measureUV(LED_265_PIN);
-  float d_280 = measureUV(LED_280_PIN);
-  float dna_meas_260 = computeAbsorbance(d_265, i0_265);
-  float dna_meas_280 = computeAbsorbance(d_280, i0_280);
-
-  // Step 3: PROTEIN 1%
-  printScreen("CAL 3/3 PROT", "PROT + arm");
-  {
-    unsigned long t0 = millis();
-    while (!armPressed && (millis() - t0 < 60000)) delay(10);
-  }
-  if (!armPressed) { printScreen("CAL ERR", "timeout"); return; }
-  armPressed = false;
-
-  printScreen("CAL 3/3 PROT", "measuring...");
-  Serial.println("--- CALIB: PROT ---");
-  float p_265 = measureUV(LED_265_PIN);
-  float p_280 = measureUV(LED_280_PIN);
-  float prot_meas_260 = computeAbsorbance(p_265, i0_265);
-  float prot_meas_280 = computeAbsorbance(p_280, i0_280);
-
-  // 較正計算（固定真値使用）
-  printScreen("CALC...", "please wait");
-  float denom260 = (dna_meas_260 - prot_meas_260);
-  float denom280 = (dna_meas_280 - prot_meas_280);
-
-  if (abs(denom260) < 1e-4f || abs(denom280) < 1e-4f) {
-    Serial.println("Calib error: standards too close");
-    printScreen("CAL ERR", "check standards");
-    return;
-  }
-
-  float nk260 = (PROT_TRUE_A260 - DNA_TRUE_A260) / denom260;
-  float nb260 = DNA_TRUE_A260 - nk260 * dna_meas_260;
-  float nk280 = (PROT_TRUE_A280 - DNA_TRUE_A280) / denom280;
-  float nb280 = DNA_TRUE_A280 - nk280 * dna_meas_280;
-
-  // 結果表示（4-5秒）
-  showCalibResult(nk260, nb260, nk280, nb280);
-  Serial.print("RESULT K260="); Serial.print(nk260, 4);
-  Serial.print(" B260="); Serial.print(nb260, 4);
-  Serial.print(" | K280="); Serial.print(nk280, 4);
-  Serial.print(" B280="); Serial.println(nb280, 4);
-
-  // 参考: ハードコード用（Serialで確認可）
-  Serial.println("=== (reference) HARD-CODE VALUES ===");
-  Serial.print("  const float K260 = "); Serial.print(nk260, 6); Serial.println(";");
-  Serial.print("  const float B260 = "); Serial.print(nb260, 6); Serial.println(";");
-  Serial.print("  const float K280 = "); Serial.print(nk280, 6); Serial.println(";");
-  Serial.print("  const float B280 = "); Serial.print(nb280, 6); Serial.println(";");
-
-  // EEPROM保存
-  saveCalibration(nk260, nb260, nk280, nb280);
-
-  // 結果（CAL OK + K/B）を4.5秒表示してからSAVED
-  delay(4500);
-  printScreen("CAL SAVED", "to EEPROM OK");
-  Serial.println("Saved to EEPROM (applied on next boot).");
-  delay(600);
-
-  // 通常測定に戻る（状態リセット）
-  mState = M_DO_I0;
-  printScreen("PUT BLANK 1/2", "press arm...");
-}
-
-// ---- EEPROMへ校正係数を保存（LGT8F328P内蔵EEPROM）----
-static uint32_t calcChecksum(const CalibData& d) {
-  // 簡易チェックサム（k/bの4float分のみ）
-  uint32_t s = 0;
-  const uint8_t *p = (const uint8_t*)&d.k260;
-  for (size_t i = 0; i < sizeof(float) * 4; i++) s += p[i];
-  return s;
-}
-
-void saveCalibration(float k260, float b260, float k280, float b280) {
-  CalibData d;
-  d.magic = CALIB_MAGIC;
-  d.version = CALIB_VERSION;
-  d.k260 = k260; d.b260 = b260;
-  d.k280 = k280; d.b280 = b280;
-  d.checksum = calcChecksum(d);
-
-  // put() は変更時のみ書き込み（E2PROM実装に依存）
-  EEPROM.put(CALIB_EEPROM_ADDR, d);
-}
-
-// ---- EEPROMから校正係数を読み込む。有効ならtrue、失敗ならfalse----
-bool loadCalibration(float& k260, float& b260, float& k280, float& b280) {
-  CalibData d;
-  EEPROM.get(CALIB_EEPROM_ADDR, d);
-
-  if (d.magic != CALIB_MAGIC) return false;   // 未保存/消去済み
-  if (d.version != CALIB_VERSION) return false;
-  if (calcChecksum(d) != d.checksum) return false; // データ破損
-
-  k260 = d.k260; b260 = d.b260;
-  k280 = d.k280; b280 = d.b280;
-  return true;
 }
 
 void loop() {
-  // アームスイッチが押されたら測定実行
-  if (armPressed) {
-    armPressed = false;
-    runMeasure();
-  }
-
-  // 校正ボタンが長押し（2秒）で校正モード
-  static unsigned long calibStart = 0;
-  if (!digitalRead(CALIB_BTN_PIN)) {
-    if (calibStart == 0) calibStart = millis();
-    else if (millis() - calibStart > 2000) {
-      calibStart = 0;
-      runCalibration();
-    }
-  } else {
-    calibStart = 0;
-  }
+  server.handleClient();
+  pollTouch();
+  delay(5);
 }

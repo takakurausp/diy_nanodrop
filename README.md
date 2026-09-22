@@ -2,68 +2,107 @@
 
 DIY DNA quantifier (UV absorbance, 260nm/280nm).
 
-This is the **AS7331 fork**. The original `main` branch uses the analog
-GUVA-S12SD sensor; this branch replaces it with the digital I2C
-**AS7331** spectral UV sensor (SparkFun SEN-23517 / Qwiic 1x1).
+This branch targets an **ESP32 board with an integrated 2.8" ST7789 touch LCD**
+and the **AS7331** spectral UV sensor, with a touch UI, guided calibration,
+WiFi (WPS) and CSV download.
 
-- Branch `main`: GUVA-S12SD (analog, A0)
-- Branch `as7331`: AS7331 (I2C, UVA/UVB/UVC)
+- Branch `main`: LGT8F328P + GUVA-S12SD (analog)
+- Branch `as7331`: LGT8F328P + AS7331 (I2C)
+- Branch `esp32` (this branch): **ESP32 + 2.8" ST7789 touch LCD + AS7331**
 
-## What changed
+## Target board
 
-| | `main` (GUVA-S12SD) | `as7331` (this branch) |
-|---|---|---|
-| Sensor | GUVA-S12SD analog module | AS7331 digital I2C |
-| Interface | ADC A0 | I2C 0x74 (shared with OLED) |
-| Channels | 1 (broadband) | UVA/UVB/UVC |
-| 265nm LED | single detector | **UVC** channel (200-280nm) |
-| 280nm LED | single detector | **UVB** channel (280-320nm) |
-| Driver | `analogRead` | in-sketch driver, no external lib |
+**ideaspark ESP32 2.8" IPS LCD touch board (240x320, ST7789)**
+<https://www.amazon.co.jp/dp/B0HHSHFZ8Q>
 
-The measurement / calibration state machine, EEPROM calibration storage,
-OLED UI and pin assignments for LEDs, button and arm switch are unchanged.
+ESP32-WROOM-32 (3.3V, 16MB), 2.8" 240x320 IPS LCD (ST7789, SPI),
+XPT2046 resistive touch, microSD, CH340G USB. Free GPIOs:
+5, 12, 16, 17, 21, 22, 25, 26, 33.
 
-## Wiring (LGT8F328P Nano, 5V)
+## UI
+
+Touch only. On boot, three large buttons:
+
+- **Calibration**
+  - Checks EEPROM for calibration data.
+  - If present: shows "Calibration data found" plus the K/B coefficients,
+    with `Re-calibrate` / `Back`.
+  - If absent: asks "Configure now?". Yes starts a guided 3-step procedure:
+    BLANK -> DNA (50 ug/mL) -> Protein (1% w/v). On-screen text tells you
+    which standard to apply at each step. The resulting K/B coefficients are
+    saved to EEPROM.
+- **Measuring**
+  - Each sample is preceded by a BLANK measurement.
+  - Flow: apply BLANK -> measure -> apply SAMPLE -> measure -> result.
+  - Result shows A260, A280, Purity and Concentration (ug/mL). Records are
+    kept in memory. After a result the screen stays until you continue and
+    warns you to apply BLANK before the next sample.
+  - A `Download data` button is on the screen edge.
+- **Settings**
+  - Brightness (backlight PWM, stored in EEPROM).
+  - WiFi settings (see below).
+  - Touch calibration (2-point, stored in EEPROM).
+  - Initialize WiFi settings (erase stored SSID/password).
+
+## WiFi
+
+- If SSID/password are stored in EEPROM, the device connects as a station.
+- Otherwise it starts an **AP**: SSID `mynanodrop`, password `12345678`,
+  IP **192.168.5.1**.
+- A WebServer runs at all times:
+  - `/` -> status page
+  - `/data.csv` -> all stored measurements as CSV
+    (index, A260, A280, Purity, Conc_ug_ml)
+- `Scan & WPS` lists nearby SSIDs; selecting one starts **WPS (push button)**.
+  Press the WPS button on your router when prompted. On success the
+  credentials are stored in EEPROM and reused on the next boot.
+
+> Note: ESP32 WPS (push-button/PBC) connects to the router that has WPS
+> enabled; the SSID you pick in the list is informational.
+
+To download data: connect your phone/PC to the same WiFi (or to the
+`mynanodrop` AP when in AP mode) and open `http://<ip>/data.csv`
+(AP mode: `http://192.168.5.1/data.csv`).
+
+## Wiring
 
 ```
-LED_265 PWM  -> D3
-LED_280 PWM  -> D5
-AS7331 SDA   -> D18   (via level shifter)
-AS7331 SCL   -> D19   (via level shifter)
-OLED  SDA    -> D18   (same bus)
-OLED  SCL    -> D19
-CALIB BUTTON -> D7
-ARM SWITCH   -> D8
+LED_265 PWM  -> GPIO16
+LED_280 PWM  -> GPIO17
+AS7331 SDA   -> GPIO21
+AS7331 SCL   -> GPIO22
 ```
 
-> **Important:** the AS7331 operates at **2.7-3.6V (3.3V)**. Power it from
-> 3.3V and put a bidirectional I2C level shifter (PCA9306, SparkFun
-> BOB-12009, etc.) between the 5V MCU and the sensor. Do not apply 5V to the
-> sensor's SDA/SCL.
+LCD and touch are already wired on the board (LCD CS=15/DC=2/RST=4/BL=32,
+touch CS=14/IRQ=27, VSPI SCK=18/MISO=19/MOSI=23). Power the AS7331 from 3.3V;
+no level shifter is needed.
 
-The AS7331 and the SSD1306 OLED share the I2C bus (0x74 and 0x3C).
-
-## Build
-
-Same as before (direct `avr-g++`, LGT8F328P core):
+## Build / upload (PlatformIO)
 
 ```bash
-USE_OLED=1 ./build.sh     # OLED + Serial
-USE_OLED=0 ./build.sh     # Serial only
+pio run                 # build
+pio run -t upload       # upload
+pio device monitor      # serial monitor (115200)
 ```
 
-`build.sh` copies `nanodrop.ino` to `main.cpp` before compiling, so keep
-edits in `nanodrop.ino`.
+or via the helper script:
+
+```bash
+./build.sh          # build
+./build.sh upload   # upload
+./build.sh monitor  # serial monitor
+```
+
+`build.sh` copies `nanodrop.ino` to `main.cpp` before building, so keep edits
+in `nanodrop.ino`. Libraries are pulled by `platformio.ini`
+(Adafruit GFX, Adafruit ST7735/ST7789, XPT2046_Touchscreen). The AS7331 driver
+is in-sketch.
 
 ## Sensor settings
 
-Defaults match the SparkFun library: gain 2x, conversion time 64ms,
-conversion clock 1.024MHz, CMD (one-shot) mode. Each measurement turns an
-LED on, waits 300ms, triggers one conversion, waits 64ms, then reads the
-result. The raw counts are converted to uW/cm2 (datasheet equation 3) before
-`A = -log10(I/I0)`.
+Defaults: gain 2x, conversion time 64ms, conversion clock 1.024MHz, CMD
+(one-shot) mode. Raw counts are converted to uW/cm2 (datasheet eq. 3) before
+`A = -log10(I/I0)`. Change `AS7331_GAIN_RAW` / `AS7331_TIME_RAW` /
+`AS7331_CCLK_RAW` to adjust.
 
-To change gain/time, edit `AS7331_GAIN_RAW` / `AS7331_TIME_RAW` /
-`AS7331_CCLK_RAW` in the sketch. The conversion factor updates automatically.
-
-See `nanodrop_BOM.md` for the full BOM and calibration standard preparation.
+See `nanodrop_BOM.md` for the BOM and calibration standard preparation.
