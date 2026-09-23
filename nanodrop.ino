@@ -8,13 +8,16 @@
  * 吸光度 A = -log10(I/I0) と純度比 A260/A280 を算出。
  *
  * ---- センサ選択 (下の SENSOR_AS7331 で切替) ----
- *   SENSOR_AS7331=1 : AS7331 (I2C デジタル 3ch)
- *   SENSOR_AS7331=0 : GUVA-S12SD (アナログ)  ← AS7331 入手困難時の間に合わせ
- *     GUVA_USE_ADS1115=1 : 外付けADC ADS1115 (16-bit I2C) を使用【推奨】
- *     GUVA_USE_ADS1115=0 : ESP32 内蔵ADC (GPIO33) を使用（簡易・精度低）
+ *   SENSOR_AS7331=0 : アナログUVフォトダイオード + TIA  ← 既定
+ *                     SG01S-C18 (SiC, sglux) を TIA で電圧に変換 → ADS1115 でAD変換
+ *     PD_USE_ADS1115=1 : 外付けADC ADS1115 (16-bit I2C) を使用【推奨】
+ *     PD_USE_ADS1115=0 : ESP32 内蔵ADC (GPIO33) を使用（簡易・精度低）
+ *     ※ GUVA-S12SD 等の他のアナログUV素子でも同じ経路が使える。
+ *   SENSOR_AS7331=1 : AS7331 (I2C デジタル 3ch)  ← 入手できれば選択可
  *
- *   ※ ESP32 内蔵ADCはノイズ・非直線性が大きく、GUVA出力(0-1V)は
- *     3.3Vレンジの一部しか使えないため分解能が低い。外付け ADS1115 を推奨。
+ *   ※ 吸光度は比 I/I0 なので TIA ゲインは式上キャンセルされ、絶対校正は不要。
+ *     ただし TIA 出力は ADS1115 のフルスケール(±4.096V)内で正に振れること。
+ *   ※ ESP32 内蔵ADCはノイズ・非直線性が大きいため外付け ADS1115 を推奨。
  *
  * ---- 画面構成 ----
  *   ホーム: [Calibration] [Measuring] [Settings] の大きなボタン + Download data
@@ -31,8 +34,9 @@
  *   LCD  : CS=15 DC=2 RST=4 BL=32 / VSPI SCK=18 MISO=19 MOSI=23
  *   Touch: CS=14 IRQ=27
  *   LED_265=GPIO16  LED_280=GPIO17
+ *   SG01S-C18 + TIA -> ADS1115 AIN0
  *   AS7331 / ADS1115: SDA=GPIO21 SCL=GPIO22 (3.3V直結)
- *   GUVA-S12SD (内蔵ADC使用時): AOUT=GPIO33 (ADC1_CH5)
+ *   TIA出力 (内蔵ADC使用時): GPIO33 (ADC1_CH5)
  */
 
 #include <Arduino.h>
@@ -49,16 +53,17 @@
 // ============================================================
 // センサ選択
 // ============================================================
-// AS7331 が使えるなら 1、間に合せで GUVA-S12SD なら 0。
+// AS7331 を使うなら 1、アナログUVフォトダイオード(SG01S-C18 + TIA)なら 0（既定）。
 // PlatformIO 等から -DSENSOR_AS7331=1 で上書き可能。
 #ifndef SENSOR_AS7331
 #define SENSOR_AS7331 0
 #endif
 
-// GUVA-S12SD の読み取り方法 (SENSOR_AS7331=0 のとき有効)
+// アナログ素子の読み取り方法 (SENSOR_AS7331=0 のとき有効)
+//   SG01S-C18 (SiC) を TIA で増幅 → ADS1115 でAD変換
 //   1 = 外付けADC ADS1115 (16-bit I2C) 【推奨】 / 0 = ESP32 内蔵ADC
-#ifndef GUVA_USE_ADS1115
-#define GUVA_USE_ADS1115 1
+#ifndef PD_USE_ADS1115
+#define PD_USE_ADS1115 1
 #endif
 
 // ============================================================
@@ -269,19 +274,20 @@ void ledOff(int pin) { analogWrite(pin, 0); }
 
 #if !SENSOR_AS7331
 // ============================================================
-// GUVA-S12SD (アナログ) + 外付けADC ADS1115 ドライバ
-//   GUVA は単一チャンネル。265/280 どちらのLEDでも同じAOUTを読む。
-//   吸光度は比 I/I0 なので生カウントのままで良い。
+// アナログUVフォトダイオード + TIA + 外付けADC ADS1115 ドライバ
+//   例: SG01S-C18 (SiC) の光電流を TIA で電圧に変換し ADS1115 AIN0 へ。
+//   単一チャンネルなので 265/280 どちらのLEDでも同じ信号を読む。
+//   吸光度は比 I/I0 なので TIA ゲイン・絶対値はキャンセルされ生カウントで良い。
 // ============================================================
-#define SENSOR_PIN 33    // 内蔵ADC使用時の AOUT (GPIO33 = ADC1_CH5)
-#define GUVA_AVG   8     // 1測定あたりの平均サンプル数
+#define SENSOR_PIN 33    // 内蔵ADC使用時の TIA出力 (GPIO33 = ADC1_CH5)
+#define PD_AVG     8     // 1測定あたりの平均サンプル数
 
-#if GUVA_USE_ADS1115
+#if PD_USE_ADS1115
 #define ADS1115_ADDR      0x48  // ADDRピン=GND
 #define ADS1115_REG_CONV  0x00
 #define ADS1115_REG_CFG   0x01
-// OS=1, MUX=AIN0-GND, PGA=±2.048V, single-shot, 128SPS, comparator off
-#define ADS1115_CFG_START 0xC583
+// OS=1, MUX=AIN0-GND, PGA=±4.096V, single-shot, 128SPS, comparator off
+#define ADS1115_CFG_START 0xC383
 
 static void adsWrite16(uint8_t reg, uint16_t v) {
   Wire.beginTransmission(ADS1115_ADDR);
@@ -316,14 +322,14 @@ static float ads1115Read() {
   }
   return (float)(int16_t)adsRead16(ADS1115_REG_CONV);
 }
-#endif  // GUVA_USE_ADS1115
+#endif  // PD_USE_ADS1115
 #endif  // !SENSOR_AS7331
 
 // センサ初期化（成功で true）
 bool sensorBegin() {
 #if SENSOR_AS7331
   return as7331Begin();
-#elif GUVA_USE_ADS1115
+#elif PD_USE_ADS1115
   return ads1115Begin();
 #else
   analogReadResolution(12);
@@ -335,7 +341,7 @@ bool sensorBegin() {
 
 // 指定LEDを点灯し、安定後に1回測定して強度を返す（エラー時 -1.0f）。
 //   AS7331: 265nm->UVC / 280nm->UVB を µW/cm² に換算
-//   GUVA  : AOUT を ADC で読む（比 I/I0 用なので単位は任意）
+//   アナログ: TIA出力を ADC で読む（比 I/I0 用なので単位は任意）
 float measureUV(int ledPin) {
   ledOn(ledPin);
   delay(CALIB_MS);
@@ -348,24 +354,24 @@ float measureUV(int ledPin) {
   if (!ok) return -1.0f;
   if (ledPin == LED_265_PIN) return as7331CountsToUwCm2(uvc, AS7331_FSR_UVC);
   return as7331CountsToUwCm2(uvb, AS7331_FSR_UVB);
-#elif GUVA_USE_ADS1115
+#elif PD_USE_ADS1115
   float sum = 0;
-  for (int i = 0; i < GUVA_AVG; i++) sum += ads1115Read();
+  for (int i = 0; i < PD_AVG; i++) sum += ads1115Read();
   ledOff(ledPin);
-  return sum / GUVA_AVG;
+  return sum / PD_AVG;
 #else
   long sum = 0;
-  for (int i = 0; i < GUVA_AVG; i++) sum += analogRead(SENSOR_PIN);
+  for (int i = 0; i < PD_AVG; i++) sum += analogRead(SENSOR_PIN);
   ledOff(ledPin);
-  return (float)sum / GUVA_AVG;
+  return (float)sum / PD_AVG;
 #endif
 }
 
 // ブランク信号の下限（これ未満は汚れ/未設置/結線ミス等）
 #if SENSOR_AS7331
 #define MIN_SIGNAL 0.5f
-#elif GUVA_USE_ADS1115
-#define MIN_SIGNAL 100.0f     // ADS1115 カウント (PGA ±2.048V)
+#elif PD_USE_ADS1115
+#define MIN_SIGNAL 50.0f      // ADS1115 カウント (PGA ±4.096V, 約6mV)
 #else
 #define MIN_SIGNAL 300.0f     // ESP32 内蔵ADC カウント
 #endif
@@ -478,6 +484,7 @@ enum Screen {
   SCR_WIFI_WPS,
   SCR_WIFI_DONE,
   SCR_TOUCHCAL,
+  SCR_LED_TUNE,
   SCR_DOWNLOAD,
   SCR_MSG
 };
@@ -769,18 +776,20 @@ void runMeasSample() {
 // ============================================================
 void renderSettings() {
   clearScreen();
-  centerText("Settings", 6, 3, COL_ACCENT);
-  drawButton(20, 48, 280, 40, "Brightness", COL_BTN, 2);
-  drawButton(20, 94, 280, 40, "WiFi settings", COL_BTN, 2);
-  drawButton(20, 140, 280, 40, "Touch calibration", COL_BTN2, 2);
-  drawButton(20, 186, 200, 40, "Initialize WiFi", COL_ERR, 2);
-  drawButton(230, 186, 70, 40, "Back", COL_BTN2, 2);
+  centerText("Settings", 4, 3, COL_ACCENT);
+  drawButton(10, 40, 300, 32, "Brightness", COL_BTN, 2);
+  drawButton(10, 76, 300, 32, "LED tune", COL_BTN, 2);
+  drawButton(10, 112, 300, 32, "WiFi settings", COL_BTN, 2);
+  drawButton(10, 148, 300, 32, "Touch calibration", COL_BTN2, 2);
+  drawButton(10, 184, 210, 32, "Initialize WiFi", COL_ERR, 2);
+  drawButton(228, 184, 82, 32, "Back", COL_BTN2, 2);
 }
 
-#define SET_BRIGHT_Y 48
-#define SET_WIFI_Y 94
-#define SET_TOUCH_Y 140
-#define SET_INIT_Y 186
+#define SET_BRIGHT_Y 40
+#define SET_LED_Y    76
+#define SET_WIFI_Y   112
+#define SET_TOUCH_Y  148
+#define SET_INIT_Y   184
 
 void renderBrightness() {
   clearScreen();
@@ -872,6 +881,112 @@ void renderTouchCal(int step) {
 }
 
 // ============================================================
+// LED 出力調整モード
+//   2つのLEDを交互に点灯し、センサ生値と電圧換算値を連続表示する。
+//   ノイズ対策として指数移動平均 (EMA) を適用:
+//       X = a * Xnow + (1 - a) * X
+//   (X: 前回のフィルタ値, a: 0<a<=1, 小さいほど平滑)
+// ============================================================
+#define TUNE_ALPHA     0.20f   // EMA係数 a
+#define TUNE_STEP_MS   200     // LED切替周期
+#define TUNE_SETTLE_MS 40      // LED点灯後の安定待ち
+#define TUNE_AVG       4       // 1回あたりの平均サンプル数
+#if !SENSOR_AS7331 && PD_USE_ADS1115
+#define ADS1115_LSB_V  (4.096f / 32768.0f)  // PGA ±4.096V の1LSB
+#endif
+
+static int   tuneIdx = 0;                 // 次に測るLED: 0=265nm, 1=280nm
+static float tuneFilt[2] = {0, 0};        // フィルタ済み生値
+static bool  tuneHas[2]  = {false, false};
+static unsigned long tuneNext = 0;
+
+// 指定LEDを点灯して1回のセンサ生値を返す（エラー時 -1.0f）
+static float tuneReadOnce(int pin) {
+  ledOn(pin);
+  delay(TUNE_SETTLE_MS);
+  float raw;
+#if SENSOR_AS7331
+  if (!as7331Start()) { ledOff(pin); return -1.0f; }
+  delay(AS7331_CONV_MS + 2);
+  uint16_t uva, uvb, uvc;
+  bool ok = as7331ReadUV(uva, uvb, uvc);
+  raw = ok ? (float)((pin == LED_265_PIN) ? uvc : uvb) : -1.0f;
+#elif PD_USE_ADS1115
+  float sum = 0;
+  for (int i = 0; i < TUNE_AVG; i++) sum += ads1115Read();
+  raw = sum / TUNE_AVG;
+#else
+  long sum = 0;
+  for (int i = 0; i < TUNE_AVG; i++) sum += analogRead(SENSOR_PIN);
+  raw = (float)sum / TUNE_AVG;
+#endif
+  ledOff(pin);
+  return raw;
+}
+
+void drawLedTuneRow(int y, const char* name, int idx) {
+  bool active = (tuneIdx == idx);
+  display.fillRoundRect(6, y, 308, 46, 8, active ? 0x1A6A : COL_BTN2);
+  display.drawRoundRect(6, y, 308, 46, 8, active ? COL_OK : COL_FG);
+  display.setTextSize(2);
+  display.setTextColor(COL_FG);
+  display.setCursor(16, y + 14);
+  display.print(name);
+  char b[24];
+  if (tuneHas[idx]) snprintf(b, sizeof(b), "%7.0f", tuneFilt[idx]);
+  else snprintf(b, sizeof(b), "%7s", "--");
+  display.setCursor(100, y + 14);
+  display.print(b);
+#if !SENSOR_AS7331 && PD_USE_ADS1115
+  if (tuneHas[idx]) snprintf(b, sizeof(b), "%.4fV", tuneFilt[idx] * ADS1115_LSB_V);
+  else snprintf(b, sizeof(b), "%.4fV", 0.0f);
+  display.setCursor(196, y + 14);
+  display.print(b);
+#endif
+}
+
+void drawLedTuneValues() {
+  drawLedTuneRow(40, "LED265", 0);
+  drawLedTuneRow(92, "LED280", 1);
+}
+
+void renderLedTune() {
+  clearScreen();
+  centerText("LED tune", 4, 3, COL_ACCENT);
+  drawLedTuneValues();
+  centerText("X = a*Xnow + (1-a)*X", 150, 1, COL_FG);
+  char b[32];
+  snprintf(b, sizeof(b), "a=%.2f  dwell=%dms", TUNE_ALPHA, TUNE_STEP_MS);
+  centerText(b, 166, 1, COL_WARN);
+  drawButton(110, 192, 100, 36, "Back", COL_BTN2, 2);
+}
+
+void showLedTune() {
+  tuneIdx = 0;
+  tuneHas[0] = tuneHas[1] = false;
+  tuneNext = millis();
+  screen = SCR_LED_TUNE;
+  renderLedTune();
+}
+
+// loop() から毎回呼ぶ。LEDを交互に測定して表示を更新する。
+void ledTuneStep() {
+  unsigned long now = millis();
+  if ((long)(now - tuneNext) < 0) return;
+  tuneNext = now + TUNE_STEP_MS;
+
+  int pin = (tuneIdx == 0) ? LED_265_PIN : LED_280_PIN;
+  float raw = tuneReadOnce(pin);
+  if (raw >= 0.0f) {
+    if (!tuneHas[tuneIdx]) { tuneFilt[tuneIdx] = raw; tuneHas[tuneIdx] = true; }
+    else tuneFilt[tuneIdx] = TUNE_ALPHA * raw + (1.0f - TUNE_ALPHA) * tuneFilt[tuneIdx];
+  }
+
+  drawLedTuneValues();
+  tuneIdx ^= 1;
+}
+
+// ============================================================
 // タッチ割当 (画面座標)
 // ============================================================
 void handleTouchCalRaw(int rx, int ry) {
@@ -949,15 +1064,20 @@ void onTouch(int x, int y) {
       break;
 
     case SCR_SETTINGS:
-      if (inRect(x, y, 20, SET_BRIGHT_Y, 280, 40)) { screen = SCR_BRIGHT; renderBrightness(); }
-      else if (inRect(x, y, 20, SET_WIFI_Y, 280, 40)) { screen = SCR_WIFI; renderWifiInfo(); }
-      else if (inRect(x, y, 20, SET_TOUCH_Y, 280, 40)) { touchCalStep = 1; screen = SCR_TOUCHCAL; renderTouchCal(1); }
-      else if (inRect(x, y, 20, SET_INIT_Y, 200, 40)) {
+      if (inRect(x, y, 10, SET_BRIGHT_Y, 300, 32)) { screen = SCR_BRIGHT; renderBrightness(); }
+      else if (inRect(x, y, 10, SET_LED_Y, 300, 32)) { showLedTune(); }
+      else if (inRect(x, y, 10, SET_WIFI_Y, 300, 32)) { screen = SCR_WIFI; renderWifiInfo(); }
+      else if (inRect(x, y, 10, SET_TOUCH_Y, 300, 32)) { touchCalStep = 1; screen = SCR_TOUCHCAL; renderTouchCal(1); }
+      else if (inRect(x, y, 10, SET_INIT_Y, 210, 32)) {
         cfg.wifiValid = 0; cfg.ssid[0] = 0; cfg.pass[0] = 0; saveConfig();
         WiFi.disconnect(true, true);
         startAP();
         showMessage("WiFi settings cleared", "AP: mynanodrop", SCR_WIFI);
-      } else if (inRect(x, y, 230, SET_INIT_Y, 70, 40)) { screen = SCR_HOME; renderHome(); }
+      } else if (inRect(x, y, 228, SET_INIT_Y, 82, 32)) { screen = SCR_HOME; renderHome(); }
+      break;
+
+    case SCR_LED_TUNE:
+      if (inRect(x, y, 110, 192, 100, 36)) { ledOff(LED_265_PIN); ledOff(LED_280_PIN); screen = SCR_SETTINGS; renderSettings(); }
       break;
 
     case SCR_BRIGHT:
@@ -1123,10 +1243,10 @@ void setup() {
   } else {
 #if SENSOR_AS7331
     Serial.println("Sensor: AS7331 ready");
-#elif GUVA_USE_ADS1115
-    Serial.println("Sensor: GUVA-S12SD via ADS1115 ready");
+#elif PD_USE_ADS1115
+    Serial.println("Sensor: SG01S-C18 (TIA) via ADS1115 ready");
 #else
-    Serial.println("Sensor: GUVA-S12SD via ESP32 ADC ready");
+    Serial.println("Sensor: SG01S-C18 (TIA) via ESP32 ADC ready");
 #endif
   }
 
@@ -1142,5 +1262,6 @@ void setup() {
 void loop() {
   server.handleClient();
   pollTouch();
+  if (screen == SCR_LED_TUNE) ledTuneStep();
   delay(5);
 }

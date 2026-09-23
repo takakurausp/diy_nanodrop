@@ -3,8 +3,10 @@
 DIY DNA quantifier (UV absorbance, 260nm/280nm).
 
 This branch targets an **ESP32 board with an integrated 2.8" ST7789 touch LCD**
-and the **AS7331** spectral UV sensor, with a touch UI, guided calibration,
-WiFi (WPS) and CSV download.
+and a DIY UV sensor module (**SG01S-C18** SiC photodiode + transimpedance
+amplifier + **ADS1115** ADC), with a touch UI, guided calibration, WiFi (WPS)
+and CSV download. The **AS7331** spectral UV sensor is also supported as a
+build option.
 
 - Branch `main`: LGT8F328P + GUVA-S12SD (analog)
 - Branch `as7331`: LGT8F328P + AS7331 (I2C)
@@ -40,9 +42,27 @@ Touch only. On boot, three large buttons:
   - A `Download data` button is on the screen edge.
 - **Settings**
   - Brightness (backlight PWM, stored in EEPROM).
+  - LED tune (see below).
   - WiFi settings (see below).
   - Touch calibration (2-point, stored in EEPROM).
   - Initialize WiFi settings (erase stored SSID/password).
+
+### LED tune
+
+To help adjust the LED output, **Settings -> LED tune** continuously alternates
+the 265nm/280nm LEDs and displays the sensor output (raw counts) and the
+voltage-converted value for each. The active LED row is highlighted.
+
+Raw readings are smoothed with an exponential moving average (EMA) to reject
+noise:
+
+```
+X = a * Xnow + (1 - a) * X
+```
+
+`a` (`TUNE_ALPHA`, default 0.20) and the per-LED dwell (`TUNE_STEP_MS`, default
+200ms) are defined in `nanodrop.ino`. The voltage column uses the ADS1115 full
+scale of +/-4.096V (1 LSB = 125uV).
 
 ## WiFi
 
@@ -71,41 +91,48 @@ The sensor is selected at build time with `SENSOR_AS7331` (see the top of
 
 | Mode | Macro | Notes |
 |------|-------|-------|
+| SG01S-C18 + TIA + ADS1115 (default) | `-DSENSOR_AS7331=0 -DPD_USE_ADS1115=1` | SiC UV photodiode + transimpedance amp, 16-bit I2C ADC, recommended |
+| SG01S-C18 + TIA + ESP32 ADC | `-DSENSOR_AS7331=0 -DPD_USE_ADS1115=0` | TIA output -> GPIO33, simple but low accuracy |
 | AS7331 (I2C, 3ch) | `-DSENSOR_AS7331=1` | Original 265nm->UVC, 280nm->UVB |
-| GUVA-S12SD + ADS1115 (default) | `-DSENSOR_AS7331=0 -DGUVA_USE_ADS1115=1` | External 16-bit I2C ADC, recommended |
-| GUVA-S12SD + ESP32 ADC | `-DSENSOR_AS7331=0 -DGUVA_USE_ADS1115=0` | AOUT -> GPIO33, simple but low accuracy |
 
-### GUVA-S12SD fallback
+### SG01S-C18 + TIA module
 
-If the AS7331 is hard to source, the analog **GUVA-S12SD** module can be used
-instead. It is a single broadband channel, so both the 265nm and 280nm
-measurements read the same detector (absorbance is still a ratio `I/I0`, so
-this works, but channel separation/cross-talk is worse than the AS7331).
+The primary detector is a **sglux SG01S-C18** SiC UV photodiode. Its
+photocurrent is converted to a voltage by a **transimpedance amplifier (TIA)**
+and digitized by an **ADS1115** 16-bit I2C ADC.
 
-**Use an external ADC (ADS1115) rather than the ESP32 internal ADC.** Reasons:
+Absorbance is a ratio `I/I0` measured on the same detector, so the TIA gain and
+the absolute responsivity cancel out: **no absolute calibration is needed**.
+Keep the TIA output positive and within the ADS1115 full scale (PGA = +/-4.096V
+in this firmware, `ADS1115_CFG_START 0xC383`).
 
-- The ESP32 ADC is noisy and non-linear (especially near the rails); factory
-  calibration is poor.
-- The GUVA-S12SD module output is roughly 0-1V, so on the 0-3.3V ESP32 ADC
-  range only ~1/3 of the codes are used, losing resolution.
-- The **ADS1115** is a 16-bit delta-sigma ADC with a PGA. At `+/-2.048V` full
-  scale, a 0-1V signal uses about half the range at ~62.5uV/LSB, and it is
-  stable. It is I2C, so it shares the existing bus.
+It is a single broadband channel, so the 265nm and 280nm measurements read the
+same detector (absorbance still works as a ratio, but channel
+separation/cross-talk is worse than the AS7331). A **GUVA-S12SD** or a similar
+analog UV photodiode can be used on the same path.
 
-Wiring (ADS1115):
+Wiring (SG01S-C18 + TIA + ADS1115):
 ```
-GUVA-S12SD AOUT -> ADS1115 AIN0
+SG01S-C18 -> TIA -> ADS1115 AIN0
 ADS1115 SDA/SCL  -> GPIO21 / GPIO22
 ADS1115 ADDR     -> GND (address 0x48)
 ADS1115 VDD/GND  -> 3.3V / GND
 ```
 The 265/280 LEDs are unchanged (GPIO16 / GPIO17).
 
+Use an external ADC (ADS1115) rather than the ESP32 internal ADC. Reasons:
+
+- The ESP32 ADC is noisy and non-linear (especially near the rails); factory
+  calibration is poor.
+- In the internal-ADC mode the TIA output must stay within the 0-3.3V ESP32
+  ADC range (use a 3.3V-powered TIA). The ADS1115 at `+/-4.096V` full scale
+  accepts a wider output swing and is stable.
+
 An **ADS1015** (12-bit, cheaper) also works in principle but its conversion
 result is left-justified in the 16-bit register; the current driver assumes
 ADS1115. Ask if you want ADS1015 support.
 
-## Wiring (AS7331)
+## Wiring (AS7331 option)
 
 ```
 LED_265 PWM  -> GPIO16

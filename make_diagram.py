@@ -26,7 +26,7 @@ def line(x1,y1,x2,y2,col,w=2):
     d.line([x1,y1,x2,y2], fill=col, width=w)
 
 d.text((W/2, 18), text="DIY Nanodrop (UV) — Block Diagram", anchor="mm", font=font(16), fill="#222")
-d.text((W/2, 40), text="ESP32-WROOM-32 + 2.8\" ST7789 LCD · 265nm+280nm UVC LED（切替）· AS7331 (I2C UV-A/B/C)", anchor="mm", font=font(11), fill="#555")
+d.text((W/2, 40), text="ESP32-WROOM-32 + 2.8\" ST7789 LCD · 265nm+280nm UVC LED（切替）· SG01S-C18 + TIA + ADS1115", anchor="mm", font=font(11), fill="#555")
 
 box(40,90,150,40,"DC 9V アダプタ",None)
 box(380,240,200,160,"ESP32-WROOM-32",None,"#000")
@@ -39,7 +39,7 @@ box(640,248,55,44,"MOSFET Q2",None)
 # 電源: LM2596降圧で5V生成 + LED用定電流(LM2596 CC)
 box(70,300,180,60,"USB 5V / LM2596\n5V (ESP32ボード)",None)
 box(70,400,180,60,"LM2596 定電流\n150mA (LED用)",None)
-box(380,520,200,70,"AS7331 UV センサ (I2C)","UVA/UVB/UVC · 3.3V · 3ch")
+box(380,520,200,70,"SG01S-C18 + TIA + ADS1115","SiC UV-PD → TIA → 16-bit I2C ADC · 3.3V")
 box(120,520,180,70,"2.8\" ST7789 LCD\n(ボード内蔵)",None)
 
 # 9V → LM2596降圧(5V) → MCU
@@ -64,7 +64,7 @@ line(190,110,380,300,"#c00",2); d.text((255,180), text="VCC", anchor="mm", font=
 line(60,680,920,680,"#333",3)
 d.text((70,702), text="GND（共通グランド: LED・センサー・MCU・ディスプレイ）", anchor="lm", font=font(10), fill="#333")
 
-d.text((40,725), text="Note: ESP32(3.3V) と AS7331(3.3V) は I2C 直結（レベルシフタ不要）。265nmはUVC、280nmはUVBで受光。校正係数はESP32のEEPROMエミュレーションへ保存(再起動時に自動適用)。", anchor="lm", font=font(9), fill="#888")
+d.text((40,725), text="Note: ESP32(3.3V) と ADS1115/AS7331(3.3V) は I2C 直結（レベルシフタ不要）。SG01Sの光電流をTIAで電圧化しADS1115でAD変換。吸光度は比I/I0でTIAゲインは不要。校正係数はESP32のEEPROMエミュレーションへ保存(再起動時に自動適用)。", anchor="lm", font=font(8), fill="#888")
 
 # ============================================================
 # 光学レイアウト（上から見た図）: V字配置・内傾 LED
@@ -93,10 +93,10 @@ d.rectangle([cvx-35, cvy-28, cvx+35, cvy-27], outline="#444", width=2, fill="#cc
 d.rectangle([cvx-35, cvy-26, cvx+35, cvy-16], outline="#0af", width=2, fill="#e0f4ff")
 d.text((cvx, cvy-10), text="UV-grade fused silica 窓", anchor="mm", font=font(8), fill="#0af")
 
-# 検出器 AS7331 — キュベットの反対側（光軸の延長上）
+# 検出器 SG01S-C18 + TIA — キュベットの反対側（光軸の延長上）
 detx, dety = 490, 680
 d.rectangle([detx-55, dety-22, detx+55, dety+22], outline="#000", width=2, fill="#fff")
-d.text((detx, dety), text="AS7331\n(3ch UV-A/B/C)", anchor="mm", font=font(11), fill="#000")
+d.text((detx, dety), text="SG01S-C18\n+ TIA", anchor="mm", font=font(11), fill="#000")
 
 # 光軸（サンプル→検出器）
 d.line([cvx, cvy+30, detx, dety-22], fill="#00c", width=2)
